@@ -1,0 +1,8 @@
+ui:
+  hide_ipads_on_screen: true
+pricing:
+  battery_default: "BATTERY CELL"
+  lcd_default: "LCM GENERIC (HARD OLED)"
+labor:
+  ceq_minutes: 2
+  use_qc_labor: true
