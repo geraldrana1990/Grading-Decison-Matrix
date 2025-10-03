@@ -1,14 +1,15 @@
 # === BB360 APP (Functional vs Refurb, Collapsible Cells) ===
 # File: grading2.py
-# Version: 2025-10-03 (Reglass isolated + cache-safe + mapping bugfix + sticky header + split labor)
-# - Reglass stays in its OWN column
-# - Reglass is REMOVED from Refurb (collapse) & refurb subtotal
-# - Reglass IS INCLUDED in Total Parts / Total Cost
-# - Sidebar "Full cache reset & rerun" button (cross-version safe)
-# - Cache namespace auto-busts when the file changes (mtime)
-# - map_category_to_parts_fast uses proper boolean mask (no KeyError)
+# Version: 2025-10-03
+# - Reglass isolated (not listed under Refurb), but included in totals
 # - Sticky table header while scrolling
-# - Labor split: Tech Labor (functional/CEQ) + Refurb Labor Cost (category + anodizing + buffing); no single "Labor Cost" column
+# - Cache-safe dev helpers + cache bust on file save
+# - Mapping bugfix in map_category_to_parts_fast (proper boolean mask)
+# - Split labor: Tech Labor (functional/CEQ) + Refurb Labor Cost (category + anodizing + buffing)
+# - Hide static parts bucket totals on screen; still present in CSV
+# - Only process rows where Profile Name ∈ {Ecotec Grading Test 1, Ecotec Grading Test 2}
+# - Defects merged from "Grading Summary 1" + "Grading Summary 2" (with legacy fallbacks)
+# - NEW: Omit rows with Analyst Result == "Not Completed" at ingestion
 
 import os, sys, time, re
 import streamlit as st
@@ -44,7 +45,6 @@ def clear_all_caches():
 DEFAULTS = {
     "ui": {
         "hide_ipads_on_screen": True,
-        # Set to False if you want the <summary> header NOT to show bucket totals
         "show_bucket_totals_in_summary": True
     },
     "pricing": {
@@ -81,11 +81,15 @@ CFG = load_config()
 APP_CACHE_VER = f"dev::{Path(__file__).stem}::{Path(__file__).stat().st_mtime_ns}"
 APP_NS = f"bb360::{Path(__file__).stem}::{APP_CACHE_VER}"
 
+# -------------------- FILTER: allowed profiles only --------------------
+ALLOWED_PROFILES = {"ECOTEC GRADING TEST 1", "ECOTEC GRADING TEST 2"}
+
 # -------------------- COLUMN MAPS --------------------
 COLUMN_SYNONYMS = {
     'imei': ['imei', 'imei/meid', 'serial', 'a number', 'sn'],
     'model': ['model', 'device model'],
-    'defects': ['failed test summary', 'defects', 'issues'],
+    # include grading summaries explicitly; keep legacy names as fallback
+    'defects': ['grading summary 1', 'grading summary 2', 'failed test summary', 'defects', 'issues'],
     'battery_cycle': ['battery cycle count', 'cycle count'],
     'battery_health': ['battery health', 'battery'],
     'profile_name': ['profile name'],
@@ -153,13 +157,42 @@ def find_column(df: pd.DataFrame, candidates: list):
                 return col_orig
     return None
 
+def find_columns(df: pd.DataFrame, candidates: list):
+    """Return all columns whose lowercase names contain any candidate token (order preserved)."""
+    lower_map = {str(c).lower().strip(): c for c in df.columns}
+    hits, seen = [], set()
+    for cand in candidates:
+        tok = cand.lower().strip()
+        for col_low, col_orig in lower_map.items():
+            if tok in col_low and col_orig not in seen:
+                hits.append(col_orig); seen.add(col_orig)
+    return hits
+
 def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     normalized = pd.DataFrame(index=df.index)
+
     for key, candidates in COLUMN_SYNONYMS.items():
-        col = find_column(df, candidates)
-        normalized[key] = df[col] if col is not None else pd.NA
+        if key == 'defects':
+            cols = find_columns(df, candidates)
+            if cols:
+                merged = (
+                    df[cols]
+                    .astype(str)
+                    .replace({'nan': '', 'None': ''}, regex=False)
+                    .agg('|'.join, axis=1)
+                    .str.replace(r'\|+', '|', regex=True)
+                    .str.strip('| ')
+                )
+                merged = merged.mask(merged.eq(''))
+                normalized[key] = merged
+            else:
+                normalized[key] = pd.NA
+        else:
+            col = find_column(df, candidates)
+            normalized[key] = df[col] if col is not None else pd.NA
+
     normalized = pd.concat([df, normalized.add_prefix('_norm_')], axis=1)
     return normalized
 
@@ -186,7 +219,7 @@ def is_lcd_failure(failure: str) -> bool:
     return bool(_re_lcd.search(str(failure)))
 
 def keyify(s: str) -> str:
-    # Compact alnum key (upper) to robustly match variants like "Reglass+Digitizer"
+    # Compact alnum key (upper)
     return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 
 # -------------------- STREAMLIT APP --------------------
@@ -237,6 +270,39 @@ if uploaded is None or parts_file is None or as_file is None:
     st.stop()
 
 df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph = load_all(uploaded, as_file, parts_file, APP_NS)
+
+# -------------------- FILTERS: Ecotec profiles + omit Not Completed --------------------
+# Filter to Ecotec Grading Test 1/2
+prof_col = find_column(df_raw, COLUMN_SYNONYMS['profile_name'])
+if prof_col is not None:
+    before_n = len(df_raw)
+    df_raw['_profile_upper'] = df_raw[prof_col].astype(str).str.upper().str.strip()
+    df_raw = df_raw[df_raw['_profile_upper'].isin(ALLOWED_PROFILES)].copy()
+    df_raw.drop(columns=['_profile_upper'], inplace=True, errors='ignore')
+    after_n = len(df_raw); dropped = before_n - after_n
+    if dropped > 0:
+        st.info(f"Filtered out {dropped} rows not in {sorted(ALLOWED_PROFILES)}.")
+    if after_n == 0:
+        st.warning("No rows matched Ecotec Grading Test 1/2. Check the 'Profile Name' values in your BB360 export.")
+        st.stop()
+else:
+    st.warning("Could not find a 'Profile Name' column to apply the Ecotec filter. Proceeding without it.")
+
+# Omit Analyst Result == Not Completed (case-insensitive)
+ar_col = find_column(df_raw, COLUMN_SYNONYMS['analyst_result'])
+if ar_col is not None:
+    before_n = len(df_raw)
+    df_raw['_analyst_lower'] = df_raw[ar_col].astype(str).str.strip().str.lower()
+    df_raw = df_raw[df_raw['_analyst_lower'] != 'not completed'].copy()
+    df_raw.drop(columns=['_analyst_lower'], inplace=True, errors='ignore')
+    after_n = len(df_raw); dropped = before_n - after_n
+    if dropped > 0:
+        st.info(f"Excluded {dropped} rows with Analyst Result = Not Completed.")
+    if after_n == 0:
+        st.warning("All rows were 'Not Completed' after filtering. Nothing to process.")
+        st.stop()
+else:
+    st.warning("Could not find an 'Analyst Result' column to exclude 'Not Completed' rows. Proceeding without it.")
 
 # -------------------- NORMALIZE (ONCE) --------------------
 norm = normalize_input_df(df_raw)
@@ -394,7 +460,7 @@ labor_rate = st.slider("Labor Rate ($/hour)", min_value=1, max_value=35, value=5
 def compute_row(row, labor_rate):
     analyst_result = str(row.get('_norm_analyst_result', row.get('Analyst Result',''))).strip().lower()
     if analyst_result == "not completed":
-        return None
+        return None  # extra safety; most are already filtered earlier
 
     # inputs & normalization
     failures = parse_failures(row.get('_norm_defects',''))
@@ -418,7 +484,7 @@ def compute_row(row, labor_rate):
     # Functional: battery
     if batt_status == "Battery Service":
         failures.append("Battery Service")
-        key = battery_type  # already upper from selectbox
+        key = battery_type  # already upper
         if (device_model, key) in PRICE_INDEX and key not in func_parts:
             func_parts.append(key); src[key] = 'battery'
         if key == "BATTERY CELL":
@@ -451,7 +517,7 @@ def compute_row(row, labor_rate):
     # Strip any RE items from refurb_parts (belt & suspenders)
     refurb_parts = [k for k in refurb_parts if keyify(k) not in {'REGLASS','REGLASSDIGITIZER'}]
 
-    # ---- Build rows & subtotals (RE not in refurb) ----
+    # ---- Build rows & subtotals ----
     func_rows, refurb_rows = [], []
     func_total = refurb_total = 0.0
     for k in func_parts:
@@ -468,51 +534,50 @@ def compute_row(row, labor_rate):
             reglass_cost_from_parts += float(r['Price'] or 0.0)
     reglass_cost = reglass_cost_preferred if reglass_cost_preferred > 0 else reglass_cost_from_parts
 
-    # ---- Labor (split into Tech vs Refurb) ----
+        # ---- Labor (split into Tech vs Refurb) ----
     def _upm(name: str) -> float:
         key = str(name).lower().replace(" ", "").replace("_", "")
         return float(UPH_INDEX.get(key, 0.0))
 
-    # Minutes for tech (functional) labor = failures + CEQ if any failures
+    # Tech labor: failures + CEQ if any failure
     tech_minutes = sum(_upm(tok) for tok in failures)
     if len(failures) > 0:
         tech_minutes += float(CFG['labor'].get('ceq_minutes', 2))
+    tech_labor_cost = (tech_minutes / 60.0) * float(labor_rate)
 
-    # Minutes for refurb labor = cosmetic category + (optional) anodizing/buffing by category
-    refurb_minutes = _upm(cat_val)
-
-    anod_min   = (_upm('anodizing') or _upm('anodize')) or 0.0
-    fb_min     = (_upm('front buffing') or _upm('frontbuff')) or 0.0
-    bb_min     = (_upm('back buffing')  or _upm('backbuff'))  or 0.0
-
-    if cat_val in {'C2','C2-C','C2-BG','C3-BG','C4'} and anod_min:
-        refurb_minutes += anod_min
-    if cat_val in {'C4','C3-HF'}:
-        refurb_minutes += (fb_min + bb_min)
-    elif cat_val in {'C3','C3-BG'}:
-        refurb_minutes += fb_min
-    elif cat_val in {'C2','C2-C'}:
-        refurb_minutes += bb_min
-
-    # Convert to costs
-    tech_labor_cost   = (tech_minutes   / 60.0) * float(labor_rate)
+    # Refurb labor: strictly category minutes for C0, C1, C3-BG, C3-HF; else 0
+    refcat_set = {'C0', 'C1', 'C3-BG', 'C3-HF', 'C3'}
+    refurb_minutes = _upm(cat_val) if cat_val in refcat_set else 0.0
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
 
-    # QC remains as separate line item
+    # QC (separate)
     qc_min  = (_upm('qc process') or _upm('qcinspection') or _upm('qc')) if CFG['labor'].get('use_qc_labor', True) else 0.0
     qc_cost = (qc_min / 60.0) * float(labor_rate) if analyst_result != 'not completed' else 0.0
 
-    # Informational components (already included in refurb_labor_cost)
-    anod_cost = ((anod_min) / 60.0) * float(labor_rate) if (cat_val in {'C2','C2-C','C2-BG','C3-BG','C4'} and anod_min) else 0.0
+    # Anodizing labor (separate process, NOT included in refurb labor)
+    anod_min = (_upm('anodizing') or _upm('anodize')) or 0.0
+    anod_cats = {'C2', 'C2-C', 'C2-BG', 'C3-BG', 'C4'}  # categories that may involve anodizing
+    if cat_val in anod_cats and anod_min > 0:
+        anod_cost = (anod_min / 60.0) * float(labor_rate)
+    else:
+        anod_cost = 0.0
+
+    # BNP labor (separate process, NOT included in refurb labor)
+    fb_min = (_upm('front buffing') or _upm('frontbuff')) or 0.0
+    bb_min = (_upm('back buffing')  or _upm('backbuff'))  or 0.0
     bnp_minutes = 0.0
-    if cat_val in {'C4','C3-HF'}: bnp_minutes = fb_min + bb_min
-    elif cat_val in {'C3','C3-BG'}: bnp_minutes = fb_min
-    elif cat_val in {'C2','C2-C'}: bnp_minutes = bb_min
+    if cat_val in {'C4','C3-HF'}:        # both
+        bnp_minutes = fb_min + bb_min
+    elif cat_val in {'C3','C3-BG'}:      # front only
+        bnp_minutes = fb_min
+    elif cat_val in {'C2','C2-C'}:       # back only
+        bnp_minutes = bb_min
     bnp_cost = (bnp_minutes / 60.0) * float(labor_rate) if bnp_minutes > 0 else 0.0
 
-    # ---- Totals: include Reglass; labor = Tech + Refurb + QC (no single "Labor Cost") ----
+    # ---- Totals: include Reglass; labor = Tech + Refurb + QC + Anodizing + BNP ----
     total_parts = func_total + refurb_total + reglass_cost
-    total_cost  = total_parts + tech_labor_cost + refurb_labor_cost + qc_cost
+    total_cost  = total_parts + tech_labor_cost + refurb_labor_cost + qc_cost + anod_cost + bnp_cost
+
 
     # ---- Collapsible cells ----
     def _mk_cell(title_text: str, rows: list, total: float) -> str:
@@ -545,8 +610,8 @@ def compute_row(row, labor_rate):
         'QC Labor': qc_cost,
         'Anodizing Labor': anod_cost,          # informational (included in refurb labor)
         'BNP Labor': bnp_cost,                 # informational (included in refurb labor)
-        'Tech Labor': tech_labor_cost,         # NEW
-        'Refurb Labor Cost': refurb_labor_cost,# NEW
+        'Tech Labor': tech_labor_cost,         # split labor
+        'Refurb Labor Cost': refurb_labor_cost,# split labor
         'Total Cost': total_cost,
     }
 
@@ -659,7 +724,7 @@ if not res_df.empty:
     </div>
     """
 
-    st.subheader("Final Results (Functional vs Refurb) — Reglass isolated; sticky header; split labor")
+    st.subheader("Final Results — Ecotec Test 1/2 only; 'Not Completed' omitted; Reglass isolated; sticky header; split labor")
     st.markdown(table_html, unsafe_allow_html=True)
 
     # CSV export: full dataset (including hidden fields), no HTML columns
