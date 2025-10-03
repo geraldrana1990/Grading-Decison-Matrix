@@ -1,18 +1,59 @@
-
-# === BB360 STABLE BASELINE — LIGHTWEIGHT (Functional vs Refurb, Collapsible Cells) ===
-# Version: 2025-10-02
-# Changes:
-#  - Restores functional part mapping (F2P + Battery + LCD) with strict per-model checks
-#  - Splits parts into Functional vs Refurb groups with separate collapsible cells
-#  - Columns: Functional Parts Cost, Refurb Parts Cost, Total Parts Cost, QC, Anodizing, BNP, Labor, Total
-#  - No per-row expanders; iPads hidden on-screen only
+# === BB360 APP (Functional vs Refurb, Collapsible Cells) ===
+# Version: 2025-10-02 + Patch-2025-10-03 R2
+# Fixes in R2:
+#  - Strong cache isolation: versioned namespace (APP_CACHE_VER/APP_NS) threaded into @st.cache_data.
+#  - One-click "Full cache reset & rerun" in the sidebar (clears cache + session_state).
+#  - Keeps prior fixes: hide Functional/Refurb/Total Parts on-screen; show robust "Reglass Cost".
 import streamlit as st
 import pandas as pd
 import re
+import yaml
 from collections import defaultdict
 import html as _html
+from pathlib import Path
 
-# -------------------- CONFIGURATION --------------------
+# -------------------- CONFIG / CACHE KEYS --------------------
+DEFAULTS = {
+    "ui": {
+        "hide_ipads_on_screen": True,
+        # Set to False if you want the collapse headers NOT to show bucket totals
+        "show_bucket_totals_in_summary": True
+    },
+    "pricing": {
+        "battery_default": "BATTERY CELL",
+        "lcd_default": "LCM GENERIC (HARD OLED)"
+    },
+    "labor": {
+        "ceq_minutes": 2,
+        "use_qc_labor": True
+    }
+}
+
+def load_config():
+    cfg_path = Path("config.yml")
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                user_cfg = yaml.safe_load(f) or {}
+        except Exception:
+            user_cfg = {}
+    else:
+        user_cfg = {}
+    cfg = DEFAULTS.copy()
+    for section, vals in user_cfg.items():
+        if isinstance(vals, dict):
+            cfg.setdefault(section, {}).update(vals)
+        else:
+            cfg[section] = vals
+    return cfg
+
+CFG = load_config()
+
+# Cache versioning & namespace (bump APP_CACHE_VER to invalidate old cache)
+APP_CACHE_VER = "2025-10-03-R2"
+APP_NS = f"bb360::{Path(__file__).stem}::{APP_CACHE_VER}"
+
+# -------------------- COLUMN MAPS --------------------
 COLUMN_SYNONYMS = {
     'imei': ['imei', 'imei/meid', 'serial', 'a number', 'sn'],
     'model': ['model', 'device model'],
@@ -22,8 +63,6 @@ COLUMN_SYNONYMS = {
     'profile_name': ['profile name'],
     'analyst_result': ['analyst result', 'result', 'grading result']
 }
-
-LCD_FAILURES = ["screen test", "screen burn", "pixel test"]
 
 MODEL_ALIASES = {
     "IPHONE SE (2020)": "IPHONE SE 2020",
@@ -80,7 +119,6 @@ def find_column(df: pd.DataFrame, candidates: list):
     for cand in candidates:
         cand_low = cand.lower().strip()
         if cand_low in lower_map: return lower_map[cand_low]
-        # fuzzy contains
     for col_low, col_orig in lower_map.items():
         for cand in candidates:
             if cand.lower().strip() in col_low:
@@ -115,21 +153,32 @@ def battery_status(cycle, health):
         status = 'Battery Service'
     return status, cycle_num, health_num
 
-def remove_redundant_parts(parts_list):
-    if not parts_list: return []
-    return list(dict.fromkeys(parts_list))
-
 _re_lcd = re.compile(r'(screen test|screen burn|pixel test)', re.I)
 def is_lcd_failure(failure: str) -> bool:
     return bool(_re_lcd.search(str(failure)))
+
+def keyify(s: str) -> str:
+    # Compact alnum key (upper) to robustly match parts like "Reglass+Digitizer" / "REGLASS_DIGITIZER"
+    return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 
 # -------------------- STREAMLIT APP --------------------
 st.set_page_config(page_title='BB360: Mobile Failure Quantification', layout='wide')
 st.title('BB360: Mobile Failure Quantification — Functional vs Refurb')
 
+# Sidebar "panic" button — clear cache + session_state
+with st.sidebar:
+    if st.button("🔄 Full cache reset & rerun"):
+        try:
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.clear()
+        finally:
+            st.experimental_rerun()
+
 # -------------------- LOAD FILES (CACHED) --------------------
 @st.cache_data(show_spinner=False)
-def load_all(uploaded, as_file, parts_file):
+def load_all(uploaded, as_file, parts_file, _ns: str = APP_NS):
+    # _ns is not used, but it's part of the cache key to isolate versions/files
     df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith('.csv') else pd.read_excel(uploaded)
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
@@ -154,7 +203,7 @@ if uploaded is None or parts_file is None or as_file is None:
     st.info('Upload BB360 export, AS Inventory file, and Pricing+Category file to continue.')
     st.stop()
 
-df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph = load_all(uploaded, as_file, parts_file)
+df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph = load_all(uploaded, as_file, parts_file, APP_NS)
 
 # -------------------- NORMALIZE (ONCE) --------------------
 norm = normalize_input_df(df_raw)
@@ -182,6 +231,9 @@ f2p_parts['Part_norm'] = f2p_parts['Part'].astype(str).str.upper().str.strip().s
 pricelist['Model_norm'] = pricelist['iPhone Model'].apply(normalize_model)
 pricelist['Part_norm'] = pricelist['Part'].astype(str).str.upper().str.strip().str.replace(r'\s+', ' ', regex=True)
 pricelist['PRICE'] = pricelist['PRICE'].astype(str).str.replace(r'[^0-9\.]', '', regex=True).replace('', '0').astype(float)
+# Normalize 'Type' and add a compact Part_key for robust matching
+pricelist['Type_norm'] = pricelist.get('Type', pd.Series(['']*len(pricelist))).astype(str).str.upper().str.strip()
+pricelist['Part_key'] = pricelist['Part_norm'].apply(keyify)
 
 # UPH index
 uph = uph[['Type of Defect', 'Ave. Repair Time (Mins)']].dropna()
@@ -221,12 +273,14 @@ ADHESIVE_INDEX = build_adhesive_index(pricelist)
 
 FRAME_BACKGLASS_MODELS = set(FRAME_BACKGLASS_MODELS)  # ensure set
 
-def SAFE_ADD(part_name, device_model, bucket, source_map, source_tag):
-    if not part_name: return
-    key = str(part_name).upper().strip()
-    if (device_model, key) in PRICE_INDEX and key not in bucket:
-        bucket.append(key)
-        source_map[key] = source_tag
+# Build RE price index by compact key ("REGLASS", "REGLASSDIGITIZER")
+RE_KEYS = {"REGLASS", "REGLASSDIGITIZER"}
+PL_RE_BY_MODEL = defaultdict(dict)
+for _, row in pricelist.iterrows():
+    if row['Type_norm'] == 'RE':
+        k = row['Part_key']
+        if k in RE_KEYS:
+            PL_RE_BY_MODEL[row['Model_norm']][k] = float(row['PRICE'])
 
 def map_category_to_parts_fast(legacy_cat, model):
     legacy_cat = str(legacy_cat).strip().upper()
@@ -243,13 +297,13 @@ def map_category_to_parts_fast(legacy_cat, model):
     if not part_keywords:
         description = str(CAT_TO_DESC.get(legacy_cat, "")).upper()
         if "BACK COVER" in description:
-            part_keywords.append("BACK COVER")
+            parts_needed.append("BACK COVER")
         if "BACKGLASS" in description or "BACK GLASS" in description:
-            part_keywords.append("BACKGLASS")
+            parts_needed.append("BACKGLASS")
         if "HOUSING FRAME" in description:
-            part_keywords.append("HOUSING FRAME")
+            parts_needed.append("HOUSING FRAME")
         if "BUFFING" in description or "POLISH" in description:
-            part_keywords.append("POLISH")
+            parts_needed.append("POLISH")
 
     model_slice = PL_BY_MODEL.get(model)
     if model_slice is not None:
@@ -285,7 +339,7 @@ labor_rate = st.slider("Labor Rate ($/hour)", min_value=1, max_value=35, value=5
 
 # -------------------- ROW COMPUTE --------------------
 def compute_row(row, labor_rate):
-    analyst_result = str(row.get('Analyst Result', '')).strip().lower()
+    analyst_result = str(row.get('_norm_analyst_result', row.get('Analyst Result',''))).strip().lower()
     if analyst_result == "not completed":
         return None
 
@@ -296,25 +350,23 @@ def compute_row(row, labor_rate):
     raw_cat = row.get('Category')
     cat_val = str(raw_cat).strip().upper() if pd.notna(raw_cat) else ""
 
-    # Buckets
     func_parts, refurb_parts = [], []
-    src = {}   # part -> source
+    src = {}
 
-    # ---- Functional mapping: F2P parts from failures ----
+    # Functional: defects -> parts
     for f in [str(f).lower().strip() for f in failures]:
         for part in F2P_INDEX.get((device_model, f), []):
             key = str(part).upper().strip()
             if (device_model, key) in PRICE_INDEX and key not in func_parts:
                 func_parts.append(key); src[key] = 'f2p'
 
-    # ---- Functional mapping: Battery (strict per-model) ----
+    # Functional: battery
     if batt_status == "Battery Service":
         failures.append("Battery Service")
-        key = battery_type  # already upper
+        key = battery_type
         if (device_model, key) in PRICE_INDEX and key not in func_parts:
             func_parts.append(key); src[key] = 'battery'
         if key == "BATTERY CELL":
-            # optional flex if exists
             model_slice = PL_BY_MODEL.get(device_model)
             if model_slice is not None:
                 fx = model_slice[model_slice['Part_norm'].str.contains("BATTERY FLEX", na=False)]
@@ -323,44 +375,58 @@ def compute_row(row, labor_rate):
                     if (device_model, fk) in PRICE_INDEX and fk not in func_parts:
                         func_parts.append(fk); src[fk] = 'battery'
 
-    # ---- Functional mapping: LCD (strict per-model) ----
+    # Functional: LCD
     if any(is_lcd_failure(f) for f in failures) or cat_val in {"C0","C2-C"}:
         if (device_model, lcd_type) in PRICE_INDEX and lcd_type not in func_parts:
             func_parts.append(lcd_type); src[lcd_type] = 'lcd'
 
-    # ---- Refurb mapping: Category + adhesives ----
+    # Refurb: cosmetic category + adhesives
     for p in map_category_to_parts_fast(cat_val, device_model):
         k = str(p).upper().strip()
         if (device_model, k) in PRICE_INDEX and k not in refurb_parts and k not in func_parts:
             refurb_parts.append(k); src[k] = 'refurb'
 
-    # ---- Refurb mapping: RE-Glass ----
+    # Refurb: RE-Glass (robust)
+    reglass_cost_preferred = 0.0
     if cat_val in {"C1", "C2", "C2-BG"}:
         has_mts = any("multitouchscreen" in str(f).lower().replace(" ", "").replace("-", "") for f in failures)
-        target = "REGLASS+DIGITIZER" if has_mts else "REGLASS"
-        pl_m = PL_BY_MODEL.get(device_model)
-        if pl_m is not None and 'Type' in pl_m.columns:
-            hit = pl_m[(pl_m['Part_norm'] == target) & (pl_m['Type'].astype(str).str.upper().str.strip() == "RE")]
-            if not hit.empty:
-                tk = hit['Part_norm'].iat[0]
-                if (device_model, tk) in PRICE_INDEX and tk not in refurb_parts and tk not in func_parts:
-                    refurb_parts.append(tk); src[tk] = 'refurb'
+        preferred_key = 'REGLASSDIGITIZER' if has_mts else 'REGLASS'
+        reglass_cost_preferred = float(PL_RE_BY_MODEL.get(device_model, {}).get(preferred_key, 0.0))
 
-    # ---- Build rows & totals ----
+        # ensure the visible RE part is in refurb list if present
+        pl_m = PL_BY_MODEL.get(device_model)
+        if pl_m is not None:
+            hits = pl_m[(pl_m['Type_norm'] == 'RE') & (pl_m['Part_key'] == preferred_key)]
+            if not hits.empty:
+                pn = hits['Part_norm'].iat[0]
+                if (device_model, pn) in PRICE_INDEX and pn not in refurb_parts and pn not in func_parts:
+                    refurb_parts.append(pn); src[pn] = 'refurb'
+
+    # Build rows & totals
     func_rows, refurb_rows = [], []
-    func_total = 0.0; refurb_total = 0.0
+    func_total = refurb_total = 0.0
     for k in func_parts:
         price = float(PRICE_INDEX.get((device_model, k), 0.0))
-        func_rows.append({'Part': k, 'Source': src.get(k,'?'), 'Price': price})
-        func_total += price
+        func_rows.append({'Part': k, 'Source': src.get(k,'?'), 'Price': price}); func_total += price
     for k in refurb_parts:
         price = float(PRICE_INDEX.get((device_model, k), 0.0))
-        refurb_rows.append({'Part': k, 'Source': src.get(k,'?'), 'Price': price})
-        refurb_total += price
+        refurb_rows.append({'Part': k, 'Source': src.get(k,'?'), 'Price': price}); refurb_total += price
     total_parts = func_total + refurb_total
 
-    # ---- Labor: base + QC + anodizing + buffing ----
-    qc_min = (uph_minutes('qc process') or uph_minutes('qcinspection') or uph_minutes('qc'))
+    # Reglass cost fallback: sum RE parts actually present
+    reglass_cost_from_parts = 0.0
+    for r in refurb_rows:
+        pk = keyify(r['Part'])
+        if pk in {'REGLASS','REGLASSDIGITIZER'}:
+            reglass_cost_from_parts += float(r['Price'] or 0.0)
+    reglass_cost = reglass_cost_preferred if reglass_cost_preferred > 0 else reglass_cost_from_parts
+
+    # Labor
+    def uph_minutes(name: str) -> float:
+        key = str(name).lower().replace(" ", "").replace("_", "")
+        return float(UPH_INDEX.get(key, 0.0))
+
+    qc_min = (uph_minutes('qc process') or uph_minutes('qcinspection') or uph_minutes('qc')) if CFG['labor'].get('use_qc_labor', True) else 0.0
     qc_cost = (qc_min / 60.0) * float(labor_rate) if analyst_result != 'not completed' else 0.0
 
     anod_min = (uph_minutes('anodizing') or uph_minutes('anodize'))
@@ -375,19 +441,15 @@ def compute_row(row, labor_rate):
     elif cat_val in {'C2','C2-C'}: buff_min = bb_min
     bnp_cost = (buff_min / 60.0) * float(labor_rate) if buff_min>0 else 0.0
 
-    # Base process time (CEQ +2 if there are faults)
-    base_time = 0.0
-    for tok in failures:
-        base_time += uph_minutes(tok)
-    base_time += uph_minutes(cat_val)
+    base_time = sum(uph_minutes(tok) for tok in failures) + uph_minutes(cat_val)
     if len(failures) > 0:
-        base_time += 2  # CEQ
+        base_time += float(CFG['labor'].get('ceq_minutes', 2))
     base_labor_cost = (base_time / 60.0) * float(labor_rate)
 
     total_labor_cost = base_labor_cost + qc_cost + anod_cost + bnp_cost
     total_cost = total_parts + total_labor_cost
 
-    # ---- Collapsible cells (markerless) ----
+    # Collapsible cells
     def _mk_cell(title_text: str, rows: list, total: float) -> str:
         if not rows:
             return f"<span style='opacity:.7'>No { _html.escape(title_text.lower()) }</span>"
@@ -396,12 +458,9 @@ def compute_row(row, labor_rate):
             f"<small style='opacity:.7'>({_html.escape(str(r['Source']))})</small></li>"
             for r in rows
         )
-        return (
-            "<details class='bb360-cell'>"
-            f"<summary>{_html.escape(title_text)} — ${total:,.2f}</summary>"
-            f"<ul>{items}</ul>"
-            "</details>"
-        )
+        show_totals = bool(CFG['ui'].get('show_bucket_totals_in_summary', True))
+        summary = _html.escape(title_text) if not show_totals else f"{_html.escape(title_text)} — ${total:,.2f}"
+        return f"<details class='bb360-cell'><summary>{summary}</summary><ul>{items}</ul></details>"
 
     functional_cell = _mk_cell("Functional", func_rows, func_total)
     refurb_cell     = _mk_cell("Refurb", refurb_rows, refurb_total)
@@ -409,16 +468,15 @@ def compute_row(row, labor_rate):
     return {
         'imei': row.get('_norm_imei'),
         'model': row.get('_norm_model'),
-        # hidden fields for CSV completeness (not shown on screen)
-        'legacy_category': cat_val,
+        'legacy_category': cat_val,          # CSV only fields
         'category_desc': row.get('Category_Desc'),
         'failures': "|".join(failures),
-        # visible columns:
         'Functional (collapse)': functional_cell,
         'Refurb (collapse)': refurb_cell,
-        'Functional Parts Cost': func_total,
-        'Refurb Parts Cost': refurb_total,
-        'Total Parts Cost': total_parts,
+        'Functional Parts Cost': func_total,   # CSV only
+        'Refurb Parts Cost': refurb_total,     # CSV only
+        'Total Parts Cost': total_parts,       # CSV only
+        'Reglass Cost': reglass_cost,          # Visible on-screen
         'QC Labor': qc_cost,
         'Anodizing Labor': anod_cost,
         'BNP Labor': bnp_cost,
@@ -427,33 +485,38 @@ def compute_row(row, labor_rate):
     }
 
 # -------------------- RUN --------------------
-rows = []
+df_rows = []
 skip_count = 0
 for _, r in norm.iterrows():
     out = compute_row(r, labor_rate)
     if out is None:
         skip_count += 1
         continue
-    rows.append(out)
+    df_rows.append(out)
 
-res_df = pd.DataFrame(rows)
+res_df = pd.DataFrame(df_rows)
 
-# -------------------- DISPLAY (collapsible cells inside table) --------------------
+# -------------------- DISPLAY --------------------
 if not res_df.empty:
-    # Hide iPads on the on-screen table only; CSV remains complete
-    disp = res_df[~res_df['model'].astype(str).str.upper().str.contains('IPAD', na=False)].copy()
+    disp = res_df.copy()
+    if CFG['ui'].get('hide_ipads_on_screen', True):
+        disp = disp[~disp['model'].astype(str).str.upper().str.contains('IPAD', na=False)]
 
+    # On-screen columns: HIDE the static buckets and Total Parts; SHOW Reglass Cost
     show_cols = [
         'imei','model',
         'Functional (collapse)','Refurb (collapse)',
-        'Functional Parts Cost','Refurb Parts Cost','Total Parts Cost',
+        'Reglass Cost',
         'QC Labor','Anodizing Labor','BNP Labor',
         'Labor Cost','Total Cost'
     ]
+    forbidden = {'Functional Parts Cost','Refurb Parts Cost','Total Parts Cost'}
+    show_cols = [c for c in show_cols if c in disp.columns and c not in forbidden]
 
-    money_cols = ['Functional Parts Cost','Refurb Parts Cost','Total Parts Cost','QC Labor','Anodizing Labor','BNP Labor','Labor Cost','Total Cost']
+    money_cols = ['Reglass Cost','QC Labor','Anodizing Labor','BNP Labor','Labor Cost','Total Cost']
     for col in money_cols:
-        disp[col] = disp[col].astype(float)
+        if col in disp.columns:
+            disp[col] = disp[col].astype(float)
 
     def _fmt_money(x: float) -> str: return f"${x:,.2f}"
 
@@ -487,11 +550,10 @@ if not res_df.empty:
       <tbody>{''.join(row_html)}</tbody>
     </table>
     """
-
-    st.subheader("Final Results (Functional vs Refurb)")
+    st.subheader("Final Results (Functional vs Refurb) — Reglass visible; static buckets hidden on-screen")
     st.markdown(table_html, unsafe_allow_html=True)
 
-    # CSV export: full dataset (including hidden fields), without HTML columns
+    # CSV export: full dataset (including hidden fields), without the HTML columns
     export_cols = [c for c in res_df.columns if c not in ['Functional (collapse)','Refurb (collapse)']]
     export_df = res_df[export_cols].copy()
     csv_bytes = export_df.to_csv(index=False).encode('utf-8')
