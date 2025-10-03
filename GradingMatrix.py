@@ -74,54 +74,7 @@ def load_config():
 
 CFG = load_config()
 
-# --- Build/Version metadata (commit, branch, dirty) ---
-import subprocess, hashlib
-from pathlib import Path
-import time
-import streamlit as st  # already imported above; harmless if duplicated
-
-def _git(cmd):
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
-        return out
-    except Exception:
-        return None
-
-def get_git_info():
-    sha = _git(["git", "rev-parse", "HEAD"])
-    branch = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    dirty = _git(["git", "status", "--porcelain"])
-    dirty = bool(dirty) if dirty is not None else None
-    return sha, branch, dirty
-
-def file_hash(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-APP_FILE = Path(__file__).resolve()
-GIT_SHA, GIT_BRANCH, GIT_DIRTY = get_git_info()
-APP_FILE_HASH = file_hash(APP_FILE)
-
-# Prefer commit SHA; fallback to file hash if git metadata isn't available
-APP_IDENTITY = (GIT_SHA[:12] if GIT_SHA else APP_FILE_HASH[:12])
-
-# Show it in the sidebar so you can verify you're on the latest build
-with st.sidebar:
-    st.caption("Build info")
-    st.write({
-        "commit": GIT_SHA[:12] if GIT_SHA else None,
-        "branch": GIT_BRANCH,
-        "dirty": GIT_DIRTY,
-        "file_hash": APP_FILE_HASH[:12],
-        "loaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "script": str(APP_FILE),
-    })
-
-# Use identity in cache namespace so any code change busts cache
-APP_CACHE_VER = f"build::{APP_IDENTITY}"
+APP_CACHE_VER = f"dev::{Path(__file__).stem}::{Path(__file__).stat().st_mtime_ns}"
 APP_NS = f"bb360::{Path(__file__).stem}::{APP_CACHE_VER}"
 
 # -------------------- FILTER: allowed profiles only --------------------
@@ -775,4 +728,3 @@ if not res_df.empty:
     st.download_button('Download Final CSV', data=csv_bytes, file_name='bb360_functional_vs_refurb.csv', mime='text/csv')
 else:
     st.info("No qualifying rows to display.")
-
