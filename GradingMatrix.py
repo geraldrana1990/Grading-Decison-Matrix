@@ -1,6 +1,6 @@
 # === BB360 APP (Functional vs Refurb, Collapsible Cells) ===
 # File: GradingMatrix.py
-# Version: 2025-10-03 (baseline+anodizing-eligibility)
+# Version: 2025-10-03 (baseline+anodizing-eligibility+BNP-fixes)
 # - Reglass isolated (not listed under Refurb), but included in totals
 # - Sticky table header while scrolling
 # - Cache-safe dev helpers + cache bust on file save
@@ -8,7 +8,8 @@
 # - Split labor: Tech Labor (functional/CEQ) + Refurb Labor Cost (category minutes)
 # - Anodizing & BNP are separate processes (NOT included in Refurb Labor)
 # - Only Ecotec Grading Test 1/2; omit Analyst Result == Not Completed
-# - NEW: Anodizing labor only for matte-side models (SE, 11, XR, 12/12 mini, 13/13 mini, 14/14 Plus)
+# - Anodizing labor only for matte-side models (SE, 11, XR, 12/12 mini, 13/13 mini, 14/14 Plus)
+# - FIXES: C4 fallback indentation, keep POLISH hint, BNP helpers moved to module scope, sidebar BNP debug made safe
 
 import os, sys, time, re
 import streamlit as st
@@ -130,15 +131,10 @@ FRAME_BACKGLASS_MODELS = {
 
 # ---------- NEW: Matte-side anodizing eligibility ----------
 ANODIZING_ELIGIBLE_MODELS = {
-    # iPhone SE family used in your data
     "IPHONE SE", "IPHONE SE 2020", "IPHONE SE 2022",
-    # 11 / XR
     "IPHONE 11", "IPHONE XR",
-    # 12 series (matte sides except Pros)
     "IPHONE 12", "IPHONE 12 MINI",
-    # 13 series (matte sides except Pros)
     "IPHONE 13", "IPHONE 13 MINI",
-    # 14 / 14 Plus (NOT 14 Pro / Pro Max)
     "IPHONE 14", "IPHONE 14 PLUS",
 }
 
@@ -148,10 +144,6 @@ def normalize_model(model_str):
     model = str(model_str).upper().strip()
     model = re.sub(r'\s+', ' ', model)
     model = re.sub(r'[\(\)]', '', model)
-    if 'SEGEN3' in model or 'SE 3' in model or '3RD GEN' in model:
-        return 'IPHONE SE 2022'
-    if 'SEGEN2' in model or 'SE 2' in model or '2ND GEN' in model:
-        return 'IPHONE SE 2020'
     return model
 
 def find_column(df: pd.DataFrame, candidates: list):
@@ -228,24 +220,6 @@ def is_lcd_failure(failure: str) -> bool:
 def keyify(s: str) -> str:
     return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 
-# -------------------- STREAMLIT APP --------------------
-st.set_page_config(page_title='BB360: Mobile Failure Quantification', layout='wide')
-st.title('BB360: Mobile Failure Quantification — Functional vs Refurb')
-
-with st.sidebar:
-    st.caption("Debug / Runtime Info")
-    st.write({
-        "script": str(Path(__file__).resolve()),
-        "streamlit": getattr(st, "__version__", "unknown"),
-        "app_ns": APP_NS,
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "python": sys.version.split()[0],
-        "cwd": os.getcwd(),
-    })
-    if st.button("🔄 Full cache reset & rerun"):
-        clear_all_caches()
-        _rerun()
-
 # -------------------- LOAD FILES (CACHED) --------------------
 @st.cache_data(show_spinner=False)
 def load_all(uploaded, as_file, parts_file, _ns: str = APP_NS):
@@ -264,6 +238,55 @@ def load_all(uploaded, as_file, parts_file, _ns: str = APP_NS):
     pricelist = pd.read_excel(parts_file, sheet_name='Pricelist')
     uph = pd.read_excel(parts_file, sheet_name='UPH')
     return df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph
+
+# -------------------- BNP synonym helpers (module scope) --------------------
+# If your UPH changes wording later (e.g., "Front Polish"), this still works.
+_BNP_SYNONYMS = {
+    "front": [
+        "front buffing", "frontbuff",
+        "front polish", "front polishing",
+        "bnp front", "front bnp",
+        "front buff & polish", "front buff and polish",
+    ],
+    "back": [
+        "back buffing", "backbuff",
+        "back polish", "back polishing",
+        "bnp back", "back bnp",
+        "back buff & polish", "back buff and polish",
+    ],
+}
+def uph_key(name: str) -> str:
+    return str(name).lower().replace(" ", "").replace("_", "")
+
+def _upm_best(UPH_INDEX: dict, *names: str) -> float:
+    best = 0.0
+    for n in names:
+        best = max(best, float(UPH_INDEX.get(uph_key(n), 0.0)))
+    return best
+
+def uph_bnp_front_minutes(UPH_INDEX: dict) -> float:
+    return _upm_best(UPH_INDEX, *_BNP_SYNONYMS["front"])
+
+def uph_bnp_back_minutes(UPH_INDEX: dict) -> float:
+    return _upm_best(UPH_INDEX, *_BNP_SYNONYMS["back"])
+
+# -------------------- STREAMLIT APP --------------------
+st.set_page_config(page_title='BB360: Mobile Failure Quantification', layout='wide')
+st.title('BB360: Mobile Failure Quantification — Functional vs Refurb')
+
+with st.sidebar:
+    st.caption("Debug / Runtime Info")
+    st.write({
+        "script": str(Path(__file__).resolve()),
+        "streamlit": getattr(st, "__version__", "unknown"),
+        "app_ns": APP_NS,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "python": sys.version.split()[0],
+        "cwd": os.getcwd(),
+    })
+    if st.button("🔄 Full cache reset & rerun"):
+        clear_all_caches()
+        _rerun()
 
 uploaded   = st.file_uploader('Upload BB360 export (CSV or Excel)', type=['xlsx','xls','csv'])
 as_file    = st.file_uploader('Upload AS file (CSV or Excel with Inventory sheet)', type=['xlsx','xls','csv'])
@@ -340,8 +363,7 @@ uph = uph[['Type of Defect', 'Ave. Repair Time (Mins)']].dropna()
 uph['Defect_norm'] = uph['Type of Defect'].astype(str).str.strip().str.lower().str.replace(" ", "").str.replace("_", "")
 UPH_INDEX = dict(zip(uph['Defect_norm'], uph['Ave. Repair Time (Mins)']))
 def uph_minutes(name: str) -> float:
-    key = str(name).lower().replace(" ", "").replace("_", "")
-    return float(UPH_INDEX.get(key, 0.0))
+    return float(UPH_INDEX.get(uph_key(name), 0.0))
 
 # Indices
 PRICE_INDEX = {(m, p): v for m, p, v in zip(pricelist['Model_norm'], pricelist['Part_norm'], pricelist['PRICE'])}
@@ -394,14 +416,18 @@ def map_category_to_parts_fast(legacy_cat, model):
         else:
             part_keywords = ["BACK COVER"]
 
+    # Description fallback — forbid structural parts for C4, but keep POLISH hint.
     if not part_keywords:
         description = str(CAT_TO_DESC.get(legacy_cat, "")).upper()
-        if "BACK COVER" in description:
-            parts_needed.append("BACK COVER")
-        if "BACKGLASS" in description or "BACK GLASS" in description:
-            parts_needed.append("BACKGLASS")
-        if "HOUSING FRAME" in description:
-            parts_needed.append("HOUSING FRAME")
+
+        if legacy_cat != "C4":
+            if "BACK COVER" in description:
+                parts_needed.append("BACK COVER")
+            if "BACKGLASS" in description or "BACK GLASS" in description:
+                parts_needed.append("BACKGLASS")
+            if "HOUSING FRAME" in description:
+                parts_needed.append("HOUSING FRAME")
+
         if "BUFFING" in description or "POLISH" in description:
             parts_needed.append("POLISH")
 
@@ -530,8 +556,7 @@ def compute_row(row, labor_rate):
 
     # ---- Labor ----
     def _upm(name: str) -> float:
-        key = str(name).lower().replace(" ", "").replace("_", "")
-        return float(UPH_INDEX.get(key, 0.0))
+        return float(UPH_INDEX.get(uph_key(name), 0.0))
 
     # Tech labor (failures + CEQ)
     tech_minutes = sum(_upm(tok) for tok in failures)
@@ -557,16 +582,18 @@ def compute_row(row, labor_rate):
     else:
         anod_cost = 0.0
 
-    # BNP (separate)
-    fb_min = (_upm('front buffing') or _upm('frontbuff')) or 0.0
-    bb_min = (_upm('back buffing')  or _upm('backbuff'))  or 0.0
+    # BNP (separate; robust to wording)
+    fb_min = uph_bnp_front_minutes(UPH_INDEX)
+    bb_min = uph_bnp_back_minutes(UPH_INDEX)
+
     bnp_minutes = 0.0
-    if cat_val in {'C4','C3-HF'}:
+    if cat_val in {'C4','C3-HF'}:        # both sides
         bnp_minutes = fb_min + bb_min
-    elif cat_val in {'C3','C3-BG'}:
+    elif cat_val in {'C3','C3-BG'}:      # front-facing
         bnp_minutes = fb_min
-    elif cat_val in {'C2','C2-C'}:
+    elif cat_val in {'C2','C2-C'}:       # back-facing
         bnp_minutes = bb_min
+
     bnp_cost = (bnp_minutes / 60.0) * float(labor_rate) if bnp_minutes > 0 else 0.0
 
     total_parts = func_total + refurb_total + reglass_cost
