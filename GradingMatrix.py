@@ -1,6 +1,6 @@
 # === BB360 APP (Functional vs Refurb, Collapsible Cells) ===
 # File: grading2.py
-# Version: 2025-10-03 (Reglass isolated + cache-safe + mapping bugfix + sticky header)
+# Version: 2025-10-03 (Reglass isolated + cache-safe + mapping bugfix + sticky header + split labor)
 # - Reglass stays in its OWN column
 # - Reglass is REMOVED from Refurb (collapse) & refurb subtotal
 # - Reglass IS INCLUDED in Total Parts / Total Cost
@@ -8,6 +8,7 @@
 # - Cache namespace auto-busts when the file changes (mtime)
 # - map_category_to_parts_fast uses proper boolean mask (no KeyError)
 # - Sticky table header while scrolling
+# - Labor split: Tech Labor (functional/CEQ) + Refurb Labor Cost (category + anodizing + buffing); no single "Labor Cost" column
 
 import os, sys, time, re
 import streamlit as st
@@ -467,36 +468,51 @@ def compute_row(row, labor_rate):
             reglass_cost_from_parts += float(r['Price'] or 0.0)
     reglass_cost = reglass_cost_preferred if reglass_cost_preferred > 0 else reglass_cost_from_parts
 
-    # ---- Labor ----
+    # ---- Labor (split into Tech vs Refurb) ----
     def _upm(name: str) -> float:
         key = str(name).lower().replace(" ", "").replace("_", "")
         return float(UPH_INDEX.get(key, 0.0))
 
-    qc_min = (_upm('qc process') or _upm('qcinspection') or _upm('qc')) if CFG['labor'].get('use_qc_labor', True) else 0.0
+    # Minutes for tech (functional) labor = failures + CEQ if any failures
+    tech_minutes = sum(_upm(tok) for tok in failures)
+    if len(failures) > 0:
+        tech_minutes += float(CFG['labor'].get('ceq_minutes', 2))
+
+    # Minutes for refurb labor = cosmetic category + (optional) anodizing/buffing by category
+    refurb_minutes = _upm(cat_val)
+
+    anod_min   = (_upm('anodizing') or _upm('anodize')) or 0.0
+    fb_min     = (_upm('front buffing') or _upm('frontbuff')) or 0.0
+    bb_min     = (_upm('back buffing')  or _upm('backbuff'))  or 0.0
+
+    if cat_val in {'C2','C2-C','C2-BG','C3-BG','C4'} and anod_min:
+        refurb_minutes += anod_min
+    if cat_val in {'C4','C3-HF'}:
+        refurb_minutes += (fb_min + bb_min)
+    elif cat_val in {'C3','C3-BG'}:
+        refurb_minutes += fb_min
+    elif cat_val in {'C2','C2-C'}:
+        refurb_minutes += bb_min
+
+    # Convert to costs
+    tech_labor_cost   = (tech_minutes   / 60.0) * float(labor_rate)
+    refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
+
+    # QC remains as separate line item
+    qc_min  = (_upm('qc process') or _upm('qcinspection') or _upm('qc')) if CFG['labor'].get('use_qc_labor', True) else 0.0
     qc_cost = (qc_min / 60.0) * float(labor_rate) if analyst_result != 'not completed' else 0.0
 
-    anod_min = (_upm('anodizing') or _upm('anodize'))
-    anod_applicable = cat_val in {'C2','C2-C','C2-BG','C3-BG','C4'}
-    anod_cost = (anod_min / 60.0) * float(labor_rate) if anod_applicable and anod_min>0 else 0.0
+    # Informational components (already included in refurb_labor_cost)
+    anod_cost = ((anod_min) / 60.0) * float(labor_rate) if (cat_val in {'C2','C2-C','C2-BG','C3-BG','C4'} and anod_min) else 0.0
+    bnp_minutes = 0.0
+    if cat_val in {'C4','C3-HF'}: bnp_minutes = fb_min + bb_min
+    elif cat_val in {'C3','C3-BG'}: bnp_minutes = fb_min
+    elif cat_val in {'C2','C2-C'}: bnp_minutes = bb_min
+    bnp_cost = (bnp_minutes / 60.0) * float(labor_rate) if bnp_minutes > 0 else 0.0
 
-    fb_min = (_upm('front buffing') or _upm('frontbuff'))
-    bb_min = (_upm('back buffing') or _upm('backbuff'))
-    buff_min = 0.0
-    if cat_val in {'C4','C3-HF'}: buff_min = fb_min + bb_min
-    elif cat_val in {'C3','C3-BG'}: buff_min = fb_min
-    elif cat_val in {'C2','C2-C'}: buff_min = bb_min
-    bnp_cost = (buff_min / 60.0) * float(labor_rate) if buff_min>0 else 0.0
-
-    base_time = sum(_upm(tok) for tok in failures) + _upm(cat_val)
-    if len(failures) > 0:
-        base_time += float(CFG['labor'].get('ceq_minutes', 2))
-    base_labor_cost = (base_time / 60.0) * float(labor_rate)
-
-    total_labor_cost = base_labor_cost + qc_cost + anod_cost + bnp_cost
-
-    # ---- Totals: include Reglass ----
+    # ---- Totals: include Reglass; labor = Tech + Refurb + QC (no single "Labor Cost") ----
     total_parts = func_total + refurb_total + reglass_cost
-    total_cost = total_parts + total_labor_cost
+    total_cost  = total_parts + tech_labor_cost + refurb_labor_cost + qc_cost
 
     # ---- Collapsible cells ----
     def _mk_cell(title_text: str, rows: list, total: float) -> str:
@@ -527,9 +543,10 @@ def compute_row(row, labor_rate):
         'Total Parts Cost': total_parts,       # CSV only (includes Reglass)
         'Reglass Cost': reglass_cost,          # Visible on-screen
         'QC Labor': qc_cost,
-        'Anodizing Labor': anod_cost,
-        'BNP Labor': bnp_cost,
-        'Labor Cost': total_labor_cost,
+        'Anodizing Labor': anod_cost,          # informational (included in refurb labor)
+        'BNP Labor': bnp_cost,                 # informational (included in refurb labor)
+        'Tech Labor': tech_labor_cost,         # NEW
+        'Refurb Labor Cost': refurb_labor_cost,# NEW
         'Total Cost': total_cost,
     }
 
@@ -551,13 +568,13 @@ if not res_df.empty:
     if CFG['ui'].get('hide_ipads_on_screen', True):
         disp = disp[~disp['model'].astype(str).str.upper().str.contains('IPAD', na=False)]
 
-    # On-screen columns: hide static buckets; show Reglass
+    # On-screen columns: hide static part-bucket totals; show Reglass + split labor
     SHOW_COLS = [
         'imei','model',
         'Functional (collapse)','Refurb (collapse)',
         'Reglass Cost',
-        'QC Labor','Anodizing Labor','BNP Labor',
-        'Labor Cost','Total Cost'
+        'Tech Labor','Refurb Labor Cost','QC Labor','Anodizing Labor','BNP Labor',
+        'Total Cost'
     ]
     FORBIDDEN = {'Functional Parts Cost','Refurb Parts Cost','Total Parts Cost'}
     # Guard against leaks
@@ -567,7 +584,7 @@ if not res_df.empty:
     present_cols = [c for c in SHOW_COLS if c in disp.columns]
     disp = disp[present_cols].copy()
 
-    money_cols = ['Reglass Cost','QC Labor','Anodizing Labor','BNP Labor','Labor Cost','Total Cost']
+    money_cols = ['Reglass Cost','Tech Labor','Refurb Labor Cost','QC Labor','Anodizing Labor','BNP Labor','Total Cost']
     for col in money_cols:
         if col in disp.columns:
             disp[col] = disp[col].astype(float)
@@ -642,7 +659,7 @@ if not res_df.empty:
     </div>
     """
 
-    st.subheader("Final Results (Functional vs Refurb) — Reglass isolated; sticky header; static buckets hidden")
+    st.subheader("Final Results (Functional vs Refurb) — Reglass isolated; sticky header; split labor")
     st.markdown(table_html, unsafe_allow_html=True)
 
     # CSV export: full dataset (including hidden fields), no HTML columns
