@@ -88,11 +88,13 @@ def _git(cmd):
         return None
 
 def get_git_info():
+    # same as before, but ignore untracked files so harmless temp files don't set dirty=True
     sha = _git(["git", "rev-parse", "HEAD"])
     branch = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    dirty = _git(["git", "status", "--porcelain"])
-    dirty = bool(dirty) if dirty is not None else None
+    dirty_out = _git(["git", "status", "--porcelain", "--untracked-files=no"])
+    dirty = bool(dirty_out) if dirty_out is not None else None
     return sha, branch, dirty
+
 
 def file_hash(path: Path) -> str:
     h = hashlib.sha256()
