@@ -1,17 +1,15 @@
 # === BB360 APP (Functional vs Refurb, Collapsible Cells) ===
 # File: GradingMatrix.py
-# Version: 2025-10-03 (baseline+anodizing-eligibility+BNP-fixes)
+# Version: 2025-10-03r4 (Live sheet resolver: contains 'inventory'/'handset')
 # - Reglass isolated (not listed under Refurb), but included in totals
 # - Sticky table header while scrolling
-# - Cache-safe dev helpers + cache bust on file save
-# - Mapping bugfix in map_category_to_parts_fast (proper boolean mask)
-# - Split labor: Tech Labor (functional/CEQ) + Refurb Labor Cost (category minutes)
-# - Anodizing & BNP are separate processes (NOT included in Refurb Labor)
+# - Split labor: Tech Labor + Refurb Labor; QC/Anodizing/BNP separate
 # - Only Ecotec Grading Test 1/2; omit Analyst Result == Not Completed
-# - Anodizing labor only for matte-side models (SE, 11, XR, 12/12 mini, 13/13 mini, 14/14 Plus)
-# - FIXES: C4 fallback indentation, keep POLISH hint, BNP helpers moved to module scope, sidebar BNP debug made safe
+# - Anodizing only for matte-side models (SE, 11, XR, 12/12 mini, 13/13 mini, 14/14 Plus)
+# - UPH key normalization strips ALL non-alphanumerics (+ fuzzy fallbacks)
+# - Live Excel loader accepts any sheet whose name CONTAINS "inventory" or "handset" (case-insensitive)
 
-import os, sys, time, re
+import os, sys, time, re, subprocess, hashlib
 import streamlit as st
 import pandas as pd
 import yaml
@@ -19,39 +17,28 @@ from collections import defaultdict
 import html as _html
 from pathlib import Path
 
-# -------------------- Streamlit cross-version helpers --------------------
+# -------------------- Streamlit helpers --------------------
 def _rerun():
     try:
-        st.rerun()  # modern Streamlit
+        st.rerun()
     except AttributeError:
-        st.experimental_rerun()  # older Streamlit
+        st.experimental_rerun()
 
 def clear_all_caches():
-    try: st.cache_data.clear()
-    except Exception: pass
-    try: st.cache_resource.clear()
-    except Exception: pass
-    try: st.experimental_memo.clear()
-    except Exception: pass
-    try: st.experimental_singleton.clear()
-    except Exception: pass
+    for fn in (getattr(st, "cache_data", None), getattr(st, "cache_resource", None)):
+        try: fn.clear()  # type: ignore
+        except Exception: pass
+    for fn in (getattr(st, "experimental_memo", None), getattr(st, "experimental_singleton", None)):
+        try: fn.clear()  # type: ignore
+        except Exception: pass
     try: st.session_state.clear()
     except Exception: pass
 
-# -------------------- CONFIG / CACHE KEYS --------------------
+# -------------------- CONFIG --------------------
 DEFAULTS = {
-    "ui": {
-        "hide_ipads_on_screen": True,
-        "show_bucket_totals_in_summary": True
-    },
-    "pricing": {
-        "battery_default": "BATTERY CELL",
-        "lcd_default": "LCM GENERIC (HARD OLED)"
-    },
-    "labor": {
-        "ceq_minutes": 2,
-        "use_qc_labor": True
-    }
+    "ui": {"hide_ipads_on_screen": True, "show_bucket_totals_in_summary": True},
+    "pricing": {"battery_default": "BATTERY CELL", "lcd_default": "LCM GENERIC (HARD OLED)"},
+    "labor": {"ceq_minutes": 2, "use_qc_labor": True}
 }
 
 def load_config():
@@ -75,11 +62,6 @@ def load_config():
 CFG = load_config()
 
 # --- Build/Version metadata (commit, branch, dirty) ---
-import subprocess, hashlib
-from pathlib import Path
-import time
-import streamlit as st  # already imported above; harmless if duplicated
-
 def _git(cmd):
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
@@ -88,13 +70,11 @@ def _git(cmd):
         return None
 
 def get_git_info():
-    # same as before, but ignore untracked files so harmless temp files don't set dirty=True
     sha = _git(["git", "rev-parse", "HEAD"])
     branch = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     dirty_out = _git(["git", "status", "--porcelain", "--untracked-files=no"])
     dirty = bool(dirty_out) if dirty_out is not None else None
     return sha, branch, dirty
-
 
 def file_hash(path: Path) -> str:
     h = hashlib.sha256()
@@ -106,26 +86,9 @@ def file_hash(path: Path) -> str:
 APP_FILE = Path(__file__).resolve()
 GIT_SHA, GIT_BRANCH, GIT_DIRTY = get_git_info()
 APP_FILE_HASH = file_hash(APP_FILE)
-
-# Prefer commit SHA; fallback to file hash if git metadata isn't available
 APP_IDENTITY = (GIT_SHA[:12] if GIT_SHA else APP_FILE_HASH[:12])
-
-# Show it in the sidebar so you can verify you're on the latest build
-with st.sidebar:
-    st.caption("Build info")
-    st.write({
-        "commit": GIT_SHA[:12] if GIT_SHA else None,
-        "branch": GIT_BRANCH,
-        "dirty": GIT_DIRTY,
-        "file_hash": APP_FILE_HASH[:12],
-        "loaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "script": str(APP_FILE),
-    })
-
-# Use identity in cache namespace so any code change busts cache
 APP_CACHE_VER = f"build::{APP_IDENTITY}"
 APP_NS = f"bb360::{Path(__file__).stem}::{APP_CACHE_VER}"
-
 
 # -------------------- FILTER: allowed profiles only --------------------
 ALLOWED_PROFILES = {"ECOTEC GRADING TEST 1", "ECOTEC GRADING TEST 2"}
@@ -179,7 +142,7 @@ FRAME_BACKGLASS_MODELS = {
     "IPHONE 15 PRO", "IPHONE 15 PRO MAX"
 }
 
-# ---------- NEW: Matte-side anodizing eligibility ----------
+# Matte-side anodizing eligibility
 ANODIZING_ELIGIBLE_MODELS = {
     "IPHONE SE", "IPHONE SE 2020", "IPHONE SE 2022",
     "IPHONE 11", "IPHONE XR",
@@ -227,8 +190,7 @@ def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
             cols = find_columns(df, candidates)
             if cols:
                 merged = (
-                    df[cols]
-                    .astype(str)
+                    df[cols].astype(str)
                     .replace({'nan': '', 'None': ''}, regex=False)
                     .agg('|'.join, axis=1)
                     .str.replace(r'\|+', '|', regex=True)
@@ -270,67 +232,39 @@ def is_lcd_failure(failure: str) -> bool:
 def keyify(s: str) -> str:
     return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 
-# -------------------- LOAD FILES (CACHED) --------------------
-@st.cache_data(show_spinner=False)
-def load_all(uploaded, as_file, parts_file, _ns: str = APP_NS):
-    df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith('.csv') else pd.read_excel(uploaded)
-    df_raw.columns = [str(c).strip() for c in df_raw.columns]
-
-    if as_file.name.lower().endswith('.csv'):
-        as_inv = pd.read_csv(as_file)
-    else:
-        xls = pd.ExcelFile(as_file)
-        inv_sheet = next((s for s in xls.sheet_names if s.strip().lower() == "inventory"), None)
-        as_inv = pd.read_excel(as_file, sheet_name=inv_sheet)
-
-    f2p_parts = pd.read_excel(parts_file, sheet_name='F2P')
-    cosmetic_cat = pd.read_excel(parts_file, sheet_name='Cosmetic Category')
-    pricelist = pd.read_excel(parts_file, sheet_name='Pricelist')
-    uph = pd.read_excel(parts_file, sheet_name='UPH')
-    return df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph
-
-# -------------------- BNP synonym helpers (module scope) --------------------
-# If your UPH changes wording later (e.g., "Front Polish"), this still works.
-_BNP_SYNONYMS = {
-    "front": [
-        "front buffing", "frontbuff",
-        "front polish", "front polishing",
-        "bnp front", "front bnp",
-        "front buff & polish", "front buff and polish",
-    ],
-    "back": [
-        "back buffing", "backbuff",
-        "back polish", "back polishing",
-        "bnp back", "back bnp",
-        "back buff & polish", "back buff and polish",
-    ],
-}
 def uph_key(name: str) -> str:
-    return str(name).lower().replace(" ", "").replace("_", "")
+    # remove ALL non-alphanumerics to defeat hidden/odd characters
+    return re.sub(r'[^a-z0-9]+', '', str(name).lower())
 
-def _upm_best(UPH_INDEX: dict, *names: str) -> float:
-    best = 0.0
-    for n in names:
-        best = max(best, float(UPH_INDEX.get(uph_key(n), 0.0)))
-    return best
+# -------------------- BNP + QC + Anodizing helpers --------------------
+def uph_contains_max(uph_df: pd.DataFrame, token_norm: str) -> float:
+    """Find max minutes where normalized 'Type of Defect' contains token_norm."""
+    if uph_df is None or uph_df.empty:
+        return 0.0
+    tmp = uph_df.copy()
+    tmp["__norm"] = tmp["Type of Defect"].astype(str).map(uph_key)
+    mins = pd.to_numeric(tmp["Ave. Repair Time (Mins)"], errors="coerce").fillna(0.0)
+    mask = tmp["__norm"].str.contains(token_norm, na=False)
+    return float(mins[mask].max() if mask.any() else 0.0)
 
-def uph_bnp_front_minutes(UPH_INDEX: dict) -> float:
-    return _upm_best(UPH_INDEX, *_BNP_SYNONYMS["front"])
-
-def uph_bnp_back_minutes(UPH_INDEX: dict) -> float:
-    return _upm_best(UPH_INDEX, *_BNP_SYNONYMS["back"])
-
-# -------------------- STREAMLIT APP --------------------
+# -------------------- APP --------------------
 st.set_page_config(page_title='BB360: Mobile Failure Quantification', layout='wide')
 st.title('BB360: Mobile Failure Quantification — Functional vs Refurb')
 
 with st.sidebar:
-    st.caption("Debug / Runtime Info")
+    st.caption("Build info")
     st.write({
-        "script": str(Path(__file__).resolve()),
+        "commit": GIT_SHA[:12] if GIT_SHA else None,
+        "branch": GIT_BRANCH,
+        "dirty": GIT_DIRTY,
+        "file_hash": APP_FILE_HASH[:12],
+        "loaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "script": str(APP_FILE),
+    })
+    st.caption("Runtime")
+    st.write({
         "streamlit": getattr(st, "__version__", "unknown"),
         "app_ns": APP_NS,
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "python": sys.version.split()[0],
         "cwd": os.getcwd(),
     })
@@ -339,16 +273,71 @@ with st.sidebar:
         _rerun()
 
 uploaded   = st.file_uploader('Upload BB360 export (CSV or Excel)', type=['xlsx','xls','csv'])
-as_file    = st.file_uploader('Upload AS file (CSV or Excel with Inventory sheet)', type=['xlsx','xls','csv'])
+# Updated label here
+as_file    = st.file_uploader('Upload Live file (CSV or Excel with Inventory/Handset sheet)', type=['xlsx','xls','csv'])
 parts_file = st.file_uploader('Upload Pricing + Categories Excel (with F2P, Cosmetic Category, Pricelist, UPH sheets)', type=['xlsx','xls'])
 
 if uploaded is None or parts_file is None or as_file is None:
-    st.info('Upload BB360 export, AS Inventory file, and Pricing+Category file to continue.')
+    st.info('Upload BB360 export, Live Inventory file, and Pricing+Category file to continue.')
     st.stop()
 
-df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph = load_all(uploaded, as_file, parts_file, APP_NS)
+@st.cache_data(show_spinner=False)
+def load_all(uploaded, as_file, parts_file, _ns: str = APP_NS):
+    # BB360 export
+    df_raw = pd.read_csv(uploaded) if uploaded.name.lower().endswith('.csv') else pd.read_excel(uploaded)
+    df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-# -------------------- FILTERS: Ecotec profiles + omit Not Completed --------------------
+    # LIVE inventory (CSV or Excel). Excel may have sheet names that CONTAIN "inventory" or "handset".
+    selected_live_sheet = None
+    if as_file.name.lower().endswith('.csv'):
+        as_inv = pd.read_csv(as_file)
+        selected_live_sheet = "(csv)"
+    else:
+        xls = pd.ExcelFile(as_file)
+        # case-insensitive substring match; prefer *inventory* then *handset*
+        inv_hit = None
+        hs_hit = None
+        for s in xls.sheet_names:
+            low = s.lower().strip()
+            if inv_hit is None and "inventory" in low:
+                inv_hit = s
+            if hs_hit is None and "handset" in low:
+                hs_hit = s
+        if inv_hit is not None:
+            target = inv_hit
+        elif hs_hit is not None:
+            target = hs_hit
+        else:
+            st.warning("No sheet name contains 'Inventory' or 'Handset' in the Live file. Using the first sheet instead.")
+            target = xls.sheet_names[0]
+        selected_live_sheet = target
+        as_inv = pd.read_excel(as_file, sheet_name=target)
+
+    # Pricing workbook
+    f2p_parts   = pd.read_excel(parts_file, sheet_name='F2P')
+    cosmetic_cat= pd.read_excel(parts_file, sheet_name='Cosmetic Category')
+    pricelist   = pd.read_excel(parts_file, sheet_name='Pricelist')
+    uph         = pd.read_excel(parts_file, sheet_name='UPH')
+    return df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph, selected_live_sheet
+
+df_raw, as_inv, f2p_parts, cosmetic_cat, pricelist, uph, LIVE_SHEET = load_all(uploaded, as_file, parts_file, APP_NS)
+
+with st.sidebar:
+    st.caption("Live workbook sheet used")
+    st.write({"sheet": LIVE_SHEET})
+
+# -------------------- FILTERS --------------------
+def find_column(df: pd.DataFrame, candidates: list):
+    lower_map = {str(c).lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        cand_low = cand.lower().strip()
+        if cand_low in lower_map: return lower_map[cand_low]
+    for col_low, col_orig in lower_map.items():
+        for cand in candidates:
+            if cand.lower().strip() in col_low:
+                return col_orig
+    return None
+
 prof_col = find_column(df_raw, COLUMN_SYNONYMS['profile_name'])
 if prof_col is not None:
     before_n = len(df_raw)
@@ -379,41 +368,75 @@ if ar_col is not None:
 else:
     st.warning("Could not find 'Analyst Result' column. Proceeding without it.")
 
-# -------------------- NORMALIZE (ONCE) --------------------
+# -------------------- NORMALIZE --------------------
+def find_columns(df: pd.DataFrame, candidates: list):
+    lower_map = {str(c).lower().strip(): c for c in df.columns}
+    hits, seen = [], set()
+    for cand in candidates:
+        tok = cand.lower().strip()
+        for col_low, col_orig in lower_map.items():
+            if tok in col_low and col_orig not in seen:
+                hits.append(col_orig); seen.add(col_orig)
+    return hits
+
+def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+    normalized = pd.DataFrame(index=df.index)
+
+    for key, candidates in COLUMN_SYNONYMS.items():
+        if key == 'defects':
+            cols = find_columns(df, candidates)
+            if cols:
+                merged = (
+                    df[cols].astype(str)
+                    .replace({'nan': '', 'None': ''}, regex=False)
+                    .agg('|'.join, axis=1)
+                    .str.replace(r'\|+', '|', regex=True)
+                    .str.strip('| ')
+                )
+                merged = merged.mask(merged.eq(''))
+                normalized[key] = merged
+            else:
+                normalized[key] = pd.NA
+        else:
+            col = find_column(df, candidates)
+            normalized[key] = df[col] if col is not None else pd.NA
+
+    normalized = pd.concat([df, normalized.add_prefix('_norm_')], axis=1)
+    return normalized
+
 norm = normalize_input_df(df_raw)
 
-# Merge AS
+# Merge Live (category)
 as_inv.columns = [str(c).strip().lower() for c in as_inv.columns]
 imei_col = next((c for c in as_inv.columns if any(k in c for k in ["imei", "sn", "serial"])), None)
 cat_col  = next((c for c in as_inv.columns if "category" in c), None)
-
 norm['_norm_imei'] = norm['_norm_imei'].astype(str).str.strip()
 as_inv[imei_col]   = as_inv[imei_col].astype(str).str.strip()
+norm = norm.merge(as_inv[[imei_col, cat_col]], left_on='_norm_imei', right_on=imei_col, how='left').rename(columns={cat_col: 'Category'})
 
-norm = norm.merge(as_inv[[imei_col, cat_col]], left_on='_norm_imei', right_on=imei_col, how='left')
-norm = norm.rename(columns={cat_col: 'Category'})
-
+# Cosmetic category descriptions
 cosmetic_cat.columns = [str(c).strip() for c in cosmetic_cat.columns]
 CAT_TO_DESC = dict(zip(cosmetic_cat['Legacy Category'], cosmetic_cat['Description']))
 norm['Category_Desc'] = norm['Category'].map(CAT_TO_DESC)
 
-# Normalize pricelist + f2p
+# Normalize pricelist + F2P
 f2p_parts['Model_norm']  = f2p_parts['iPhone Model'].apply(normalize_model)
 f2p_parts['Faults_norm'] = f2p_parts['Faults'].astype(str).str.lower().str.strip()
 f2p_parts['Part_norm']   = f2p_parts['Part'].astype(str).str.upper().str.strip().str.replace(r'\s+', ' ', regex=True)
 
 pricelist['Model_norm'] = pricelist['iPhone Model'].apply(normalize_model)
 pricelist['Part_norm']  = pricelist['Part'].astype(str).str.upper().str.strip().str.replace(r'\s+', ' ', regex=True)
-pricelist['PRICE']      = pricelist['PRICE'].astype(str).str.replace(r'[^0-9\.]', '', regex=True).replace('', '0').astype(float)
+pricelist['PRICE']      = pd.to_numeric(pricelist['PRICE'].astype(str).str.replace(r'[^0-9\.]', '', regex=True).replace('', '0'), errors="coerce").fillna(0.0)
 pricelist['Type_norm']  = pricelist.get('Type', pd.Series(['']*len(pricelist))).astype(str).str.upper().str.strip()
 pricelist['Part_key']   = pricelist['Part_norm'].apply(keyify)
 
-# UPH index
-uph = uph[['Type of Defect', 'Ave. Repair Time (Mins)']].dropna()
-uph['Defect_norm'] = uph['Type of Defect'].astype(str).str.strip().str.lower().str.replace(" ", "").str.replace("_", "")
+# UPH index (hard normalization)
+uph = uph[['Type of Defect', 'Ave. Repair Time (Mins)']].dropna(subset=['Type of Defect']).copy()
+uph['Defect_norm'] = uph['Type of Defect'].map(uph_key)
+uph['Ave. Repair Time (Mins)'] = pd.to_numeric(uph['Ave. Repair Time (Mins)'], errors="coerce").fillna(0.0)
 UPH_INDEX = dict(zip(uph['Defect_norm'], uph['Ave. Repair Time (Mins)']))
-def uph_minutes(name: str) -> float:
-    return float(UPH_INDEX.get(uph_key(name), 0.0))
 
 # Indices
 PRICE_INDEX = {(m, p): v for m, p, v in zip(pricelist['Model_norm'], pricelist['Part_norm'], pricelist['PRICE'])}
@@ -427,15 +450,11 @@ def build_adhesive_index(pricelist_df):
     out = defaultdict(dict)
     for model, part in zip(pricelist_df['Model_norm'], pricelist_df['Part_norm']):
         up = str(part).upper()
-        if "ADHESIVE" not in up:
-            continue
+        if "ADHESIVE" not in up: continue
         key = None
-        if "LCM" in up:
-            key = "LCM ADHESIVE"
-        elif "BATTERY" in up:
-            key = "BATTERY ADHESIVE"
-        elif "HOUSING" in up:
-            key = "BACK HOUSING ADHESIVE"
+        if "LCM" in up: key = "LCM ADHESIVE"
+        elif "BATTERY" in up: key = "BATTERY ADHESIVE"
+        elif "HOUSING" in up: key = "BACK HOUSING ADHESIVE"
         if key:
             prev = out[model].get(key)
             if prev is None or ("OEM" in up and "OEM" not in str(prev).upper()):
@@ -457,7 +476,6 @@ for _, row in pricelist.iterrows():
 def map_category_to_parts_fast(legacy_cat, model):
     legacy_cat = str(legacy_cat).strip().upper()
     parts_needed = []
-
     part_keywords = CATEGORY_PARTS_MAPPING.get(legacy_cat, [])
 
     if legacy_cat in {"C0", "C1", "C3"}:
@@ -466,18 +484,12 @@ def map_category_to_parts_fast(legacy_cat, model):
         else:
             part_keywords = ["BACK COVER"]
 
-    # Description fallback — forbid structural parts for C4, but keep POLISH hint.
     if not part_keywords:
         description = str(CAT_TO_DESC.get(legacy_cat, "")).upper()
-
         if legacy_cat != "C4":
-            if "BACK COVER" in description:
-                parts_needed.append("BACK COVER")
-            if "BACKGLASS" in description or "BACK GLASS" in description:
-                parts_needed.append("BACKGLASS")
-            if "HOUSING FRAME" in description:
-                parts_needed.append("HOUSING FRAME")
-
+            if "BACK COVER" in description: parts_needed.append("BACK COVER")
+            if "BACKGLASS" in description or "BACK GLASS" in description: parts_needed.append("BACKGLASS")
+            if "HOUSING FRAME" in description: parts_needed.append("HOUSING FRAME")
         if "BUFFING" in description or "POLISH" in description:
             parts_needed.append("POLISH")
 
@@ -488,26 +500,18 @@ def map_category_to_parts_fast(legacy_cat, model):
     for k in part_keywords:
         kk = str(k).upper()
         if kk == "HOUSING FRAME":
-            cond = (
-                model_slice['Part_norm'].str.contains("HOUSING", na=False) &
-                model_slice['Part_norm'].str.contains("FRAME",   na=False) &
-                ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False)
-            )
+            cond = (model_slice['Part_norm'].str.contains("HOUSING", na=False) &
+                    model_slice['Part_norm'].str.contains("FRAME",   na=False) &
+                    ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
             matches = model_slice[cond]
         elif kk == "BACKGLASS":
-            cond = (
-                (
-                    model_slice['Part_norm'].str.contains("BACKGLASS", na=False) |
+            cond = (((model_slice['Part_norm'].str.contains("BACKGLASS", na=False)) |
                     (model_slice['Part_norm'].str.contains("BACK", na=False) &
-                     model_slice['Part_norm'].str.contains("GLASS", na=False))
-                ) &
-                ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False)
-            )
+                     model_slice['Part_norm'].str.contains("GLASS", na=False))) &
+                    ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
             matches = model_slice[cond]
         else:
-            cond = model_slice['Part_norm'].str.contains(kk, na=False)
-            matches = model_slice[cond]
-
+            matches = model_slice[model_slice['Part_norm'].str.contains(kk, na=False)]
         if not matches.empty:
             parts_needed.append(matches['Part_norm'].iat[0])
 
@@ -536,10 +540,9 @@ def compute_row(row, labor_rate):
 
     failures = parse_failures(row.get('_norm_defects',''))
     batt_status, cycle_num, health_num = battery_status(row.get('_norm_battery_cycle'), row.get('_norm_battery_health'))
-    device_model = normalize_model(row.get('_norm_model'))
-    device_model = MODEL_ALIASES.get(device_model, device_model)
-    raw_cat = row.get('Category')
-    cat_val = str(raw_cat).strip().upper() if pd.notna(raw_cat) else ""
+    model_raw = normalize_model(row.get('_norm_model'))
+    device_model = MODEL_ALIASES.get(model_raw, model_raw)
+    cat_val = str(row.get('Category') or '').strip().upper()
 
     func_parts, refurb_parts = [], []
     src = {}
@@ -567,8 +570,7 @@ def compute_row(row, labor_rate):
                         func_parts.append(fk); src[fk] = 'battery'
 
     # LCD
-    _re_lcd_local = re.compile(r'(screen test|screen burn|pixel test)', re.I)
-    if any(_re_lcd_local.search(str(f)) for f in failures) or cat_val in {"C0","C2-C"}:
+    if any(_re_lcd.search(str(f)) for f in failures) or cat_val in {"C0","C2-C"}:
         if (device_model, lcd_type) in PRICE_INDEX and lcd_type not in func_parts:
             func_parts.append(lcd_type); src[lcd_type] = 'lcd'
 
@@ -585,7 +587,7 @@ def compute_row(row, labor_rate):
         preferred_key = 'REGLASSDIGITIZER' if has_mts else 'REGLASS'
         reglass_cost_preferred = float(PL_RE_BY_MODEL.get(device_model, {}).get(preferred_key, 0.0))
 
-    # strip any RE items from refurb list (belt & suspenders)
+    # strip RE from refurb list
     refurb_parts = [k for k in refurb_parts if keyify(k) not in {'REGLASS','REGLASSDIGITIZER'}]
 
     # Price rows
@@ -604,7 +606,7 @@ def compute_row(row, labor_rate):
             reglass_cost_from_parts += float(r['Price'] or 0.0)
     reglass_cost = reglass_cost_preferred if reglass_cost_preferred > 0 else reglass_cost_from_parts
 
-    # ---- Labor ----
+    # ---- Labor helpers ----
     def _upm(name: str) -> float:
         return float(UPH_INDEX.get(uph_key(name), 0.0))
 
@@ -619,35 +621,47 @@ def compute_row(row, labor_rate):
     refurb_minutes = _upm(cat_val) if cat_val in refcat_set else 0.0
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
 
-    # QC (separate)
-    qc_min  = (_upm('qc process') or _upm('qcinspection') or _upm('qc')) if CFG['labor'].get('use_qc_labor', True) else 0.0
-    qc_cost = (qc_min / 60.0) * float(labor_rate) if analyst_result != 'not completed' else 0.0
+    # QC (separate) — direct then fuzzy
+    qc_min = 0.0
+    if CFG['labor'].get('use_qc_labor', True):
+        for key_try in ["qc process","qc inspection","qcinspection","qc","quality control","quality check"]:
+            qc_min = max(qc_min, _upm(key_try))
+        if qc_min == 0:
+            qc_min = max(qc_min, uph_contains_max(uph, uph_key("qc")))
+    qc_cost = (qc_min / 60.0) * float(labor_rate)
 
-    # Anodizing eligibility: model must be matte-side eligible AND category allows anodizing
-    anod_min  = (_upm('anodizing') or _upm('anodize')) or 0.0
+    # Anodizing eligibility + minutes — direct then fuzzy
+    anod_min = 0.0
+    for key_try in ["anodizing","anodize","anodising","anodise","anodizing process"]:
+        anod_min = max(anod_min, _upm(key_try))
+    if anod_min == 0:
+        anod_min = max(anod_min, uph_contains_max(uph, "anodiz"))
     anod_cats = {'C2', 'C2-C', 'C2-BG', 'C3-BG', 'C4'}
     model_is_eligible_for_anodizing = device_model in ANODIZING_ELIGIBLE_MODELS
-    if model_is_eligible_for_anodizing and cat_val in anod_cats and anod_min > 0:
-        anod_cost = (anod_min / 60.0) * float(labor_rate)
-    else:
-        anod_cost = 0.0
+    anod_cost = (anod_min / 60.0) * float(labor_rate) if (model_is_eligible_for_anodizing and cat_val in anod_cats and anod_min > 0) else 0.0
 
-    # BNP (separate; robust to wording)
-    fb_min = uph_bnp_front_minutes(UPH_INDEX)
-    bb_min = uph_bnp_back_minutes(UPH_INDEX)
-
+    # BNP (separate; both sides for C4/C3-HF, front only C3/C3-BG, back only C2/C2-C)
+    fb_min = max(_upm("front buffing"), _upm("frontbuff"), _upm("front polish"), _upm("front polishing"))
+    if fb_min == 0:
+        fb_min = uph_contains_max(uph, uph_key("front buffing"))
+    bb_min = max(_upm("back buffing"), _upm("backbuff"), _upm("back polish"), _upm("back polishing"))
+    if bb_min == 0:
+        bb_min = uph_contains_max(uph, uph_key("back buffing"))
     bnp_minutes = 0.0
-    if cat_val in {'C4','C3-HF'}:        # both sides
-        bnp_minutes = fb_min + bb_min
-    elif cat_val in {'C3','C3-BG'}:      # front-facing
-        bnp_minutes = fb_min
-    elif cat_val in {'C2','C2-C'}:       # back-facing
-        bnp_minutes = bb_min
-
+    if cat_val in {'C4','C3-HF'}:        bnp_minutes = fb_min + bb_min
+    elif cat_val in {'C3','C3-BG'}:      bnp_minutes = fb_min
+    elif cat_val in {'C2','C2-C'}:       bnp_minutes = bb_min
     bnp_cost = (bnp_minutes / 60.0) * float(labor_rate) if bnp_minutes > 0 else 0.0
 
     total_parts = func_total + refurb_total + reglass_cost
     total_cost  = total_parts + tech_labor_cost + refurb_labor_cost + qc_cost + anod_cost + bnp_cost
+
+    # --- optional debug probe (toggle in sidebar) ---
+    st.session_state.setdefault("dbg_rows", [])
+    st.session_state["dbg_rows"].append({
+        "imei": row.get("_norm_imei"), "model": device_model, "cat": cat_val,
+        "fb_min": float(fb_min), "bb_min": float(bb_min), "anod_min": float(anod_min), "qc_min": float(qc_min)
+    })
 
     def _mk_cell(title_text: str, rows: list, total: float) -> str:
         if not rows:
@@ -695,6 +709,10 @@ for _, r in norm.iterrows():
 res_df = pd.DataFrame(rows)
 
 # -------------------- DISPLAY --------------------
+with st.sidebar:
+    if "dbg_rows" in st.session_state and st.checkbox("🔍 Show BNP/Anodizing/QC minutes debug", value=False):
+        st.dataframe(pd.DataFrame(st.session_state["dbg_rows"]).head(25), use_container_width=True)
+
 if not res_df.empty:
     disp = res_df.copy()
     if CFG['ui'].get('hide_ipads_on_screen', True):
