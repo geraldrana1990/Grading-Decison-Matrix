@@ -1,11 +1,12 @@
 # === BB360 APP (Functional vs Refurb, Collapsible Cells) ===
 # File: GradingMatrix.py
-# Version: 2025-10-03r7
+# Version: 2025-10-03r9 (SKU display)
 # - Live sheet resolver accepts: "inventory", "handset", or "raw data"
 # - Blank/None Category from Live becomes "No Category" (display & CSV)
 # - Shows ONLY rows whose IMEI exists in Live (after Ecotec/Not-Completed filters)
 # - Ecotec-only; omit "Not Completed"; Reglass isolated; matte-side anodizing eligibility
-# - Sticky header; Live sheet name shown; sidebar filters & sorting
+# - Sticky header; filters & sorting; Live sheet name shown
+# - NEW: Display SKU (prefer Live.SKU; else Live.Model+Capacity+Color; else BB360 model)
 
 import os, sys, time, re, subprocess, hashlib
 import streamlit as st
@@ -309,11 +310,26 @@ as_inv.columns = [str(c).strip().lower() for c in as_inv.columns]
 imei_col = next((c for c in as_inv.columns if any(k in c for k in ["imei", "sn", "serial"])), None)
 cat_col  = next((c for c in as_inv.columns if "category" in c), None)
 
+# Discover optional Live columns for SKU, color, capacity, model (display only)
+def _find_live_col(substrs):
+    for c in as_inv.columns:
+        low = str(c).lower().strip()
+        if any(s in low for s in substrs):
+            return c
+    return None
+
+sku_col        = _find_live_col(["sku", "sku name", "sku#", "sku id", "sku description"])
+live_model_col = _find_live_col(["model", "device model", "device"])
+color_col      = _find_live_col(["color", "colour"])
+capacity_col   = _find_live_col(["capacity", "storage", "rom"])
+
 norm['_norm_imei'] = norm['_norm_imei'].astype(str).str.strip()
 as_inv[imei_col]   = as_inv[imei_col].astype(str).str.strip()
 
+# Choose which Live cols to merge
+live_cols_to_merge = [c for c in [imei_col, cat_col, sku_col, live_model_col, color_col, capacity_col] if c]
 merged = norm.merge(
-    as_inv[[imei_col, cat_col]],
+    as_inv[live_cols_to_merge],
     left_on='_norm_imei',
     right_on=imei_col,
     how='left',
@@ -330,6 +346,48 @@ merged['Category'] = (
     merged['Category']
     .astype(str).str.strip()
     .mask(lambda s: (s.eq('')) | (s.str.lower().eq('nan')) | (s.str.lower().eq('none')), 'No Category')
+)
+
+# --- Build a display SKU: prefer explicit SKU from Live; else Model+Capacity+Color; else BB360 model ---
+def _cap_norm(x: str) -> str:
+    s = str(x or '').strip()
+    if not s or s.lower() in ('nan', 'none'):
+        return ''
+    m = re.search(r'(\d+)\s*(tb|gb|g|gig|gigabyte|gigabytes)?', s, re.I)
+    if m:
+        num = m.group(1)
+        unit = m.group(2) or 'GB'
+        unit = 'TB' if unit.lower().startswith('t') else 'GB'
+        return f"{num}{unit}"
+    return s.upper()
+
+def _capwords(s: str) -> str:
+    s = str(s or '').strip()
+    if not s or s.lower() in ('nan', 'none'):
+        return ''
+    return ' '.join(w.capitalize() for w in s.split())
+
+merged['SKU'] = ''
+if sku_col:
+    merged['SKU'] = merged[sku_col].astype(str).str.strip()
+
+fallback_model_series = merged[live_model_col] if (live_model_col and live_model_col in merged.columns) else merged['_norm_model']
+cap_series = merged[capacity_col].astype(str) if (capacity_col and capacity_col in merged.columns) else ''
+col_series = merged[color_col].astype(str) if (color_col and color_col in merged.columns) else ''
+
+built = (
+    fallback_model_series.astype(str).str.upper().str.strip()
+    + (' ' + pd.Series(cap_series).apply(_cap_norm)).replace(' ', '', regex=False)
+    + (' ' + pd.Series(col_series).apply(_capwords)).replace(' ', '', regex=False)
+).str.strip()
+
+merged['SKU'] = merged['SKU'].mask(
+    merged['SKU'].eq('') | merged['SKU'].str.lower().isin(['nan','none']),
+    built
+)
+merged['SKU'] = merged['SKU'].mask(
+    merged['SKU'].eq('') | merged['SKU'].str.lower().isin(['nan','none']),
+    merged['_norm_model'].astype(str).str.upper().str.strip()
 )
 
 norm = merged  # proceed with filtered dataset only
@@ -538,13 +596,21 @@ def compute_row(row, labor_rate):
     refurb_minutes = _upm(cat_val) if cat_val in refcat_set else 0.0
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
 
+    # NEW: Reglass labor (based on UPH "reglass" vs "reglassdigitizer", same decision rule as price)
+    reglass_minutes = 0.0
+    reglass_labor_cost = 0.0
+    if cat_val in {"C1", "C2", "C2-BG"}:
+        has_mts = any("multitouchscreen" in str(f).lower().replace(" ", "").replace("-", "") for f in failures)
+        reglass_key_for_uph = "reglassdigitizer" if has_mts else "reglass"
+        reglass_minutes = _upm(reglass_key_for_uph)
+        reglass_labor_cost = (reglass_minutes / 60.0) * float(labor_rate)
+
     # QC
     qc_min = 0.0
     if CFG['labor'].get('use_qc_labor', True):
         for key_try in ["qc process","qc inspection","qcinspection","qc","quality control","quality check"]:
             qc_min = max(qc_min, _upm(key_try))
         if qc_min == 0:
-            # fuzzy fallback
             tmp = uph.copy()
             tmp["__norm"] = tmp["Type of Defect"].astype(str).map(uph_key)
             mins = pd.to_numeric(tmp["Ave. Repair Time (Mins)"], errors="coerce").fillna(0.0)
@@ -589,10 +655,11 @@ def compute_row(row, labor_rate):
     bnp_cost = (bnp_minutes / 60.0) * float(labor_rate) if bnp_minutes > 0 else 0.0
 
     total_parts = func_total + refurb_total + reglass_cost
-    total_cost  = total_parts + tech_labor_cost + refurb_labor_cost + qc_cost + anod_cost + bnp_cost
+    total_cost  = total_parts + tech_labor_cost + refurb_labor_cost + reglass_labor_cost + qc_cost + anod_cost + bnp_cost
 
     def _mk_cell(title_text: str, rows: list, total: float) -> str:
-        if not rows: return f"<span style='opacity:.5'>No { _html.escape(title_text.lower()) }</span>"
+        if not rows:
+            return "<span class='bb360-empty' title='No parts in this bucket'>&mdash;</span>"
         items = "".join(
             f"<li>{_html.escape(r['Part'])} — ${r['Price']:,.2f} "
             f"<small style='opacity:.7'>({_html.escape(str(r['Source']))})</small></li>"
@@ -607,7 +674,8 @@ def compute_row(row, labor_rate):
 
     return {
         'imei': row.get('_norm_imei'),
-        'model': row.get('_norm_model'),
+        'model': row.get('_norm_model'),  # kept for CSV/reference
+        'SKU': row.get('SKU'),            # display column
         'legacy_category': cat_val,
         'category_desc': row.get('Category_Desc'),
         'failures': "|".join(failures),
@@ -622,6 +690,7 @@ def compute_row(row, labor_rate):
         'BNP Labor': bnp_cost,
         'Tech Labor': tech_labor_cost,
         'Refurb Labor Cost': refurb_labor_cost,
+        'Reglass Labor Cost': reglass_labor_cost,  # NEW: visible
         'Total Cost': total_cost,
     }
 
@@ -644,7 +713,8 @@ if not res_df.empty:
         _min_cost = float(res_df['Total Cost'].min()) if 'Total Cost' in res_df.columns else 0.0
         _max_cost = float(res_df['Total Cost'].max()) if 'Total Cost' in res_df.columns else 0.0
 
-        f_model = st.text_input("Model contains", "")
+        f_sku   = st.text_input("SKU contains", "")
+        f_model = st.text_input("Model contains (CSV only)", "")
         f_imei  = st.text_input("IMEI contains", "")
         f_def   = st.text_input("Defects contain", "")
         f_cats  = st.multiselect("Category is", options=_all_categories, default=_all_categories)
@@ -653,7 +723,7 @@ if not res_df.empty:
         st.markdown("---")
         st.subheader("Sort")
         sortable_cols = [
-            'Reglass Cost','Tech Labor','Refurb Labor Cost','QC Labor',
+            'Reglass Cost','Tech Labor','Refurb Labor Cost','Reglass Labor Cost','QC Labor',
             'Anodizing Labor','BNP Labor','Total Cost'
         ]
         opts = [c for c in sortable_cols if c in res_df.columns]
@@ -662,6 +732,7 @@ if not res_df.empty:
         s_asc = st.toggle("Ascending", value=False)
 
     filt = res_df.copy()
+    if f_sku:   filt = filt[filt['SKU'].astype(str).str.contains(f_sku, case=False, na=False)]
     if f_model: filt = filt[filt['model'].astype(str).str.contains(f_model, case=False, na=False)]
     if f_imei:  filt = filt[filt['imei'].astype(str).str.contains(f_imei, case=False, na=False)]
     if f_def:   filt = filt[filt['failures'].astype(str).str.contains(f_def, case=False, na=False)]
@@ -681,10 +752,10 @@ if not filt.empty:
         disp = disp[~disp['model'].astype(str).str.upper().str.contains('IPAD', na=False)]
 
     SHOW_COLS = [
-        'imei','model',
+        'imei','SKU',   # show SKU instead of model
         'Functional (collapse)','Refurb (collapse)',
         'Reglass Cost',
-        'Tech Labor','Refurb Labor Cost','QC Labor','Anodizing Labor','BNP Labor',
+        'Tech Labor','Refurb Labor Cost','Reglass Labor Cost','QC Labor','Anodizing Labor','BNP Labor',
         'Total Cost'
     ]
     FORBIDDEN = {'Functional Parts Cost','Refurb Parts Cost','Total Parts Cost'}
@@ -693,7 +764,7 @@ if not filt.empty:
     present_cols = [c for c in SHOW_COLS if c in disp.columns]
     disp = disp[present_cols].copy()
 
-    money_cols = ['Reglass Cost','Tech Labor','Refurb Labor Cost','QC Labor','Anodizing Labor','BNP Labor','Total Cost']
+    money_cols = ['Reglass Cost','Tech Labor','Refurb Labor Cost','Reglass Labor Cost','QC Labor','Anodizing Labor','BNP Labor','Total Cost']
     for col in money_cols:
         if col in disp.columns:
             disp[col] = disp[col].astype(float)
@@ -741,6 +812,12 @@ if not filt.empty:
         background: #ffffff;
         box-shadow: 0 1px 0 0 #e5e5e5;
       }}
+      .bb360-empty {{ opacity: .5; }}
+      .bb360-cell summary {{ cursor: pointer; font-weight: 600; display: inline; }}
+      .bb360-cell summary::-webkit-details-marker {{ display: none; }}
+      .bb360-cell summary::marker {{ content: ''; }}
+      .bb360-cell summary:hover {{ text-decoration: underline; }}
+      .bb360-cell ul {{ margin: 8px 0 0 18px; }}
     </style>
     <div class="bb360-wrap">
       <table class="bb360-table">
@@ -750,10 +827,10 @@ if not filt.empty:
     </div>
     """
 
-    st.subheader("Final Results — IMEIs present in Live only (filtered & sorted)")
+    st.subheader("Final Results — IMEIs in Live only (SKU shown)")
     st.markdown(table_html, unsafe_allow_html=True)
 
-    # CSV export: filtered rows
+    # CSV export: filtered rows (keep both SKU and model for traceability)
     export_cols = [c for c in filt.columns if c not in ['Functional (collapse)','Refurb (collapse)']]
     export_df = filt[export_cols].copy()
     csv_bytes = export_df.to_csv(index=False).encode('utf-8')
