@@ -55,6 +55,11 @@ def load_config():
     return cfg
 CFG = load_config()
 
+
+LCD_CATEGORY_FALLBACK_MIN = 45.0  # minutes for C0/C2-C when LCD swap is implied by category
+_re_lcd = re.compile(r'(pixel\s*test|screen\s*burn|screen\s*test)', re.I)  # already present? keep one copy
+
+
 ALLOWED_PROFILES = {"ECOTEC GRADING TEST 1", "ECOTEC GRADING TEST 2"}
 COLUMN_SYNONYMS = {
     'imei': ['imei', 'imei/meid', 'serial', 'a number', 'sn'],
@@ -207,6 +212,8 @@ merged['SKU'] = merged['SKU'].mask(merged['SKU'].eq('') | merged['SKU'].str.lowe
 model_key_norm = fallback_model_series.apply(normalize_model).astype(str).str.upper().str.strip()
 merged['SKU_KEY'] = (model_key_norm + (' ' + pd.Series(cap_series).apply(_cap_norm)).replace(' ','',regex=False)).str.strip()
 
+IGNORE_B_FOR_DECISION = {'C0', 'C1', 'C3', 'C3-BG', 'C2-BG'}
+
 # Pricing normalization
 cosmetic_cat.columns = [str(c).strip() for c in cosmetic_cat.columns]
 CAT_TO_DESC = dict(zip(cosmetic_cat['Legacy Category'], cosmetic_cat['Description']))
@@ -265,6 +272,20 @@ def adhesive_total_for(model, cat_val):
         if part_name and (model, part_name) in PRICE_INDEX:
             total += float(PRICE_INDEX[(model, part_name)])
     return total
+def adhesive_list_for(model, cat_val):
+    """Return the adhesive part names (from Pricelist) for this model+category."""
+    parts = []
+    for ak in CATEGORY_ADHESIVES_MAPPING.get(str(cat_val).upper(), []):
+        p = ADHESIVE_INDEX.get(model, {}).get(ak)
+        if p and (model, p) in PRICE_INDEX:
+            parts.append(p)
+    # de-dupe while preserving order
+    seen, out = set(), []
+    for p in parts:
+        if p not in seen:
+            out.append(p); seen.add(p)
+    return out
+
 
 def cosmetic_keywords_for(legacy_cat, model):
     legacy_cat = str(legacy_cat).strip().upper()
@@ -284,9 +305,15 @@ def cosmetic_keywords_for(legacy_cat, model):
             out.append(k); seen.add(k)
     return out
 
-def select_cosmetic_total_grade_A(model, cat_val):
+def select_cosmetic_breakdown_grade_A(model, cat_val):
+    """
+    Returns: (total_price: float, picked_parts: list[str], adhesive_parts: list[str])
+    Where picked_parts are the cosmetic parts (D-COVER preferred) and adhesive_parts are the category adhesives.
+    """
     total = 0.0
+    picked = []
     model_slice = PL_BY_MODEL.get(model)
+
     if model_slice is not None:
         for kw in cosmetic_keywords_for(cat_val, model):
             kwu = str(kw).upper()
@@ -299,16 +326,30 @@ def select_cosmetic_total_grade_A(model, cat_val):
                         (model_slice['Part_norm'].str.contains("BACK", na=False) &
                          model_slice['Part_norm'].str.contains("GLASS", na=False))) &
                          ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
-            else: # BACK COVER
+            else:  # BACK COVER
                 cond = (model_slice['Part_norm'].str.contains("BACK COVER", na=False) &
                         ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
+
             cand = model_slice[cond]
             pref = cand[cand['Type_norm'].str.upper() == 'D-COVER']
             chosen = pref if not pref.empty else cand
             if not chosen.empty:
                 total += float(chosen['PRICE'].iat[0])
-    total += adhesive_total_for(model, cat_val)
-    return total
+                picked.append(str(chosen['Part_norm'].iat[0]))
+
+    # Adhesives for A
+    adhs = adhesive_list_for(model, cat_val)
+    for a in adhs:
+        total += float(PRICE_INDEX[(model, a)])
+
+    # de-dupe parts list (preserve order)
+    seen, dedup = set(), []
+    for p in picked:
+        if p not in seen:
+            dedup.append(p); seen.add(p)
+
+    return total, dedup, adhs
+
 
 # Purchase Price
 purchase_price.columns = [str(c).strip() for c in purchase_price.columns]
@@ -361,53 +402,80 @@ def battery_status(cycle, health):
         status = 'Battery Service'
     return status, cycle_num, health_num
 
-_re_lcd = re.compile(r'(screen test|screen burn|pixel test)', re.I)
 
 def compute_row(row, labor_rate):
+    analyst_result = str(row.get('_norm_analyst_result', row.get('Analyst Result',''))).strip().lower()
+    if analyst_result == "not completed":
+        return None
+
+    # --- inputs / normalization ---
     failures = parse_failures(row.get('_norm_defects',''))
     batt_status, _, _ = battery_status(row.get('_norm_battery_cycle'), row.get('_norm_battery_health'))
-    model_raw = normalize_model(row.get('_norm_model')); device_model = model_raw
+    model_raw = normalize_model(row.get('_norm_model'))
+    device_model = model_raw
     cat_val = str(row.get('Category') or '').strip().upper()
     sku_key = str(row.get('SKU_KEY') or '').strip().upper()
 
-    # functional parts
-    func_parts = []
-    for f in [str(f).lower().strip() for f in failures]:
-        for part in F2P_INDEX.get((device_model, f), []):
-            key = str(part).upper().strip()
-            if (device_model, key) in PRICE_INDEX and key not in func_parts:
-                func_parts.append(key)
+    # Detect explicit LCD failures
+    lcd_failure_present = any(_re_lcd.search(str(f)) for f in failures)
+    # Original parts rule: LCD needed if explicit failure OR certain categories
+    lcd_needed = lcd_failure_present or cat_val in {"C0", "C2-C"}
 
+    # --- functional parts selection ---
+    func_parts = []
+    seen_fp = set()
+    def _add_fp(p):
+        p = str(p).upper().strip()
+        if p and p not in seen_fp:
+            seen_fp.add(p); func_parts.append(p)
+
+    # F2P from failure → parts mapping
+    for f in failures:
+        for part in F2P_INDEX.get((device_model, str(f).lower().strip()), []):
+            # Only add if priced for this model
+            if (device_model, str(part).upper().strip()) in PRICE_INDEX:
+                _add_fp(part)
+
+    # Battery service path
     if batt_status == "Battery Service":
-        key = battery_type
-        if (device_model, key) in PRICE_INDEX and key not in func_parts:
-            func_parts.append(key)
-        if key == "BATTERY CELL":
+        if (device_model, battery_type) in PRICE_INDEX:
+            _add_fp(battery_type)
+        if battery_type == "BATTERY CELL":
+            # try to add BATTERY FLEX if priced
             model_slice = PL_BY_MODEL.get(device_model)
             if model_slice is not None:
                 fx = model_slice[model_slice['Part_norm'].str.contains("BATTERY FLEX", na=False)]
                 if not fx.empty:
-                    fk = fx['Part_norm'].iat[0]
-                    if (device_model, fk) in PRICE_INDEX and fk not in func_parts:
-                        func_parts.append(fk)
+                    fk = str(fx['Part_norm'].iat[0]).upper().strip()
+                    if (device_model, fk) in PRICE_INDEX:
+                        _add_fp(fk)
 
-    if any(_re_lcd.search(str(f)) for f in failures) or cat_val in {"C0","C2-C"}:
-        if (device_model, lcd_type) in PRICE_INDEX and lcd_type not in func_parts:
-            func_parts.append(lcd_type)
+    # LCD part when needed
+    if lcd_needed and (device_model, lcd_type) in PRICE_INDEX:
+        _add_fp(lcd_type)
 
     func_total = sum(float(PRICE_INDEX.get((device_model, k), 0.0)) for k in func_parts)
 
+    # --- TECH LABOR MINUTES ---
     tech_minutes = sum(float(UPH_INDEX.get(uph_key(tok), 0.0)) for tok in failures)
-    if failures: tech_minutes += float(CFG['labor'].get('ceq_minutes', 2))
+    if failures:
+        tech_minutes += float(CFG['labor'].get('ceq_minutes', 2))
+
+    # Category-only LCD fallback minutes (no double counting when failure already present)
+    if cat_val in {"C0", "C2-C"} and not lcd_failure_present:
+        tech_minutes += LCD_CATEGORY_FALLBACK_MIN  # +45.0 min
+
     tech_labor_cost = (tech_minutes / 60.0) * float(labor_rate)
 
-    refcat_set = {'C0','C1','C3-BG','C3-HF','C3'}
+    # --- Refurb labor by category ---
+    refcat_set = {'C0', 'C1', 'C3-BG', 'C3-HF', 'C3'}
     refurb_minutes = float(UPH_INDEX.get(uph_key(cat_val), 0.0)) if cat_val in refcat_set else 0.0
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
 
+    # --- Re-glass price/labor ---
     RE_ELIGIBLE_CATS = {'C1','C2','C2-BG'}
     re_applicable = cat_val in RE_ELIGIBLE_CATS
-    has_mts = any("multitouchscreen" in str(f).lower().replace(" ","").replace("-","") for f in failures) if re_applicable else False
+    has_mts = any("multitouchscreen" in str(f).lower().replace(" ", "").replace("-", "") for f in failures) if re_applicable else False
     re_min_candidates = []
     if re_applicable:
         if has_mts:
@@ -420,6 +488,7 @@ def compute_row(row, labor_rate):
     preferred_key = 'REGLASSDIGITIZER' if has_mts else 'REGLASS'
     reglass_price = float(PL_RE_BY_MODEL.get(device_model, {}).get(preferred_key, 0.0)) if re_applicable else 0.0
 
+    # --- QC, BNP, Anodizing ---
     qc_min = 0.0
     for key_try in ["qc process","qc inspection","qcinspection","qc","quality control","quality check"]:
         qc_min = max(qc_min, float(UPH_INDEX.get(uph_key(key_try), 0.0)))
@@ -440,47 +509,94 @@ def compute_row(row, labor_rate):
     anod_cats = {'C2','C2-C','C2-BG','C3-BG','C4'}
     anod_cost = (anod_min / 60.0) * float(labor_rate) if (device_model in ANODIZING_ELIGIBLE_MODELS and cat_val in anod_cats and anod_min>0) else 0.0
 
-    cos_A = select_cosmetic_total_grade_A(device_model, cat_val)  # parts + adhesives
-    cos_B = adhesive_total_for(device_model, cat_val)             # adhesives only
+    # --- Cosmetic costs & lists for CSV ---
+    cos_A, cosA_parts_list, cosA_adh_list = select_cosmetic_breakdown_grade_A(device_model, cat_val)  # parts + adhesives
+    adh_list_only = adhesive_list_for(device_model, cat_val)
+    cos_B = sum(float(PRICE_INDEX.get((device_model, a), 0.0)) for a in adh_list_only)
 
+    # --- Totals ---
     refurb_A = func_total + cos_A + reglass_price + reglass_labor_cost + refurb_labor_cost + anod_cost + bnp_cost + tech_labor_cost + qc_cost
     refurb_B = func_total + cos_B + reglass_price + reglass_labor_cost + refurb_labor_cost + anod_cost + bnp_cost + tech_labor_cost + qc_cost
     refurb_C = func_total + tech_labor_cost + qc_cost
 
+    # --- Prices & margins ---
     pp = PURCHASE_INDEX.get(sku_key, {"acq":0.0,"A":0.0,"B":0.0,"C":0.0})
     acq = float(pp["acq"]); price_A = float(pp["A"]); price_B = float(pp["B"]); price_C = float(pp["C"])
     margin_A = price_A - (acq + refurb_A)
     margin_B = price_B - (acq + refurb_B)
     margin_C = price_C - (acq + refurb_C)
 
-    best_grade, best_price, best_margin, best_refurb = max(
-        [("A", price_A, margin_A, refurb_A), ("B", price_B, margin_B, refurb_B), ("C", price_C, margin_C, refurb_C)],
-        key=lambda t: t[2]
-    )
+    # --- Decision (ignore B for some cats) ---
+    b_ineligible = cat_val in IGNORE_B_FOR_DECISION
+    candidates = [("A", price_A, margin_A, refurb_A), ("C", price_C, margin_C, refurb_C)]
+    if not b_ineligible:
+        candidates.append(("B", price_B, margin_B, refurb_B))
+    best_grade, best_price, best_margin, best_refurb = max(candidates, key=lambda t: t[2])
 
-    return {
+    # --- Build final parts list used by the chosen path ---
+    final_parts = []
+    def _extend_unique(seq):
+        seen = set(final_parts)
+        for x in seq:
+            if x and x not in seen:
+                final_parts.append(x); seen.add(x)
+
+    _extend_unique(func_parts)
+    re_part_used = preferred_key if (re_applicable and reglass_price > 0) else ""
+    if best_grade == "A":
+        _extend_unique(cosA_parts_list)
+        _extend_unique(cosA_adh_list)
+        if re_part_used: _extend_unique([re_part_used])
+    elif best_grade == "B":
+        _extend_unique(adh_list_only)
+        if re_part_used: _extend_unique([re_part_used])
+    # Grade C adds no cosmetic/reglass parts
+
+    # --- Output row ---
+    out = {
         'IMEI': row.get('_norm_imei'),
         'SKU': row.get('SKU'),
         'Model (CSV)': row.get('_norm_model'),
         'Legacy Category': cat_val,
         'Failures (parsed)': "|".join(failures),
+
         'Functional Parts Price': func_total,
         'Refurb Price (Category Parts) Grade A': cos_A,
         'Refurb Price (Category Parts) Grade B': cos_B,
         'Reglass Parts Price': reglass_price,
+
         'Tech Labor Cost': tech_labor_cost,
         'Refurb Labor Cost': refurb_labor_cost,
         'Reglass Labor Cost': reglass_labor_cost,
         'QC Labor Cost': qc_cost,
         'BNP Labor Cost': bnp_cost,
         'Anodizing Labor Cost': anod_cost,
+
         'Total Refurbishment Cost': best_refurb,
         'Acquisition Cost': acq,
+
         'Grade A Selling Price': price_A, 'Grade A Margin': margin_A,
-        'Grade B Selling Price': price_B, 'Grade B Margin': margin_B,
         'Grade C Selling Price': price_C, 'Grade C Margin': margin_C,
         'Final Selling Price': best_price, 'Final Margin': best_margin, 'Final Grade': best_grade,
     }
+    if b_ineligible:
+        out['Grade B Selling Price'] = 'N/A'
+        out['Grade B Margin'] = 'N/A'
+    else:
+        out['Grade B Selling Price'] = price_B
+        out['Grade B Margin'] = margin_B
+
+    # CSV parts breakdown
+    out['Functional Parts (List)']       = "|".join(func_parts)
+    out['Cosmetic Parts Grade A (List)'] = "|".join(cosA_parts_list)
+    out['Adhesives (By Category)']       = "|".join(cosA_adh_list)
+    out['Reglass Type Used']             = re_part_used
+    out['Final Parts Used (List)']       = "|".join(final_parts)
+
+    return out
+
+
+
 
 rows = []
 for _, r in merged.iterrows():
@@ -506,12 +622,18 @@ if not res_df.empty:
     present_cols = [c for c in SHOW_COLS if c in disp.columns]
     disp = disp[present_cols].copy()
 
-    # pretty money formatting in HTML table for readability
+        # Do NOT coerce entire columns to numeric — we want to keep "N/A" strings intact
     money_cols = [c for c in present_cols if c not in ['IMEI','SKU','Final Grade']]
-    for col in money_cols:
-        disp[col] = pd.to_numeric(disp[col], errors='coerce').fillna(0.0)
 
-    def _fmt_money(x: float) -> str: return f"${x:,.2f}"
+    def _fmt_money_or_na(v):
+        # Show N/A strings as-is; numbers with $; everything else stringified
+        s = str(v).strip().upper()
+        if s in {"N/A", "NA", "NONE", ""}:
+            return "N/A"
+        try:
+            return f"${float(v):,.2f}"
+        except (ValueError, TypeError):
+            return str(v)
 
     row_html = []
     for _, row in disp.iterrows():
@@ -519,14 +641,20 @@ if not res_df.empty:
         for c in present_cols:
             v = row[c]
             if c in money_cols:
-                if c in ['Final Margin']:
-                    color = '#d6f5d6' if float(v) >= 0 else '#ffd6e7'
-                    tds.append(f"<td style='white-space:nowrap;text-align:right;background:{color}'>{_fmt_money(float(v))}</td>")
+                # special background for Final Margin if numeric
+                if c == 'Final Margin':
+                    try:
+                        val = float(v)
+                        color = '#d6f5d6' if val >= 0 else '#ffd6e7'
+                        tds.append(f"<td style='white-space:nowrap;text-align:right;background:{color}'>{_fmt_money_or_na(v)}</td>")
+                    except (ValueError, TypeError):
+                        tds.append(f"<td style='white-space:nowrap;text-align:right'>{_fmt_money_or_na(v)}</td>")
                 else:
-                    tds.append(f"<td style='white-space:nowrap;text-align:right'>{_fmt_money(float(v))}</td>")
+                    tds.append(f"<td style='white-space:nowrap;text-align:right'>{_fmt_money_or_na(v)}</td>")
             else:
                 tds.append(f"<td>{_html.escape(str(v))}</td>")
         row_html.append("<tr>" + "".join(tds) + "</tr>")
+
 
     header_html = "".join(f"<th>{_html.escape(c)}</th>" for c in present_cols)
     table_html = f"""
