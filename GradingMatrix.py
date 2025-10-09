@@ -805,9 +805,17 @@ def compute_row(row, labor_rate):
     tech_labor_cost = (tech_minutes / 60.0) * float(labor_rate)
 
     # Refurb labor (category)
-    refcat_set = {'C0','C1','C3-BG','C3-HF','C3'}
+    # -------------------- Refurb labor (category) --------------------
+    # Categories that should pull refurb minutes directly from the UPH table.
+    # You asked to ADD 'C2' and 'C2-BG' here (leaving C2-C as-is).
+    refcat_set = {'C0', 'C1', 'C2', 'C2-BG', 'C3-BG', 'C3-HF', 'C3'}
+
+    # Look up minutes by the category token (expects rows like "C2" and "C2-BG" in UPH["Type of Defect"])
     refurb_minutes = float(UPH_INDEX.get(uph_key(cat_val), 0.0)) if cat_val in refcat_set else 0.0
+
+    # Convert minutes → cost
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
+
 
     # Re-glass (eligible cats only)
     RE_ELIGIBLE_CATS = {'C1','C2','C2-BG'}
