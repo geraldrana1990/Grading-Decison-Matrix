@@ -101,7 +101,7 @@ PARTS_PUBLIC_URL = os.environ.get("PARTS_PUBLIC_URL", "").strip()
 LIVE_PUBLIC_URL  = os.environ.get("LIVE_PUBLIC_URL", "").strip()
 HTTP_TTL = int(os.environ.get("HTTP_TTL", "900"))  # seconds
 
-PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")   # parts workbook (xlsx)
+PARTS_TARGET = (DATA_ROOT / "pricing vs parts (1).xlsx" / "parts-http.auto.xlsx")   # parts workbook (xlsx)
 LIVE_TARGET  = (DATA_ROOT / "AS (1).xlsx")                      # Live workbook exact name
 
 def _fresh_enough(path: Path, ttl: int) -> bool:
@@ -983,4 +983,5 @@ if not res_df.empty:
     st.download_button('Download Full CSV', data=csv_bytes, file_name='bb360_business_view_full.csv', mime='text/csv')
 else:
     st.info("No qualifying rows to display.")
+
 
