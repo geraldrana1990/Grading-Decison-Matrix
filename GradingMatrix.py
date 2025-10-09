@@ -1,24 +1,26 @@
-# === BB360 APP — Clean Business View — r6d-nojson ===
+# === BB360 APP — Clean Business View — r6d-nojson (AS.xlsx default) ===
 # Date: 2025-10-09
 #
 # What’s included:
 # • Autoload Parts & Live from public OneDrive links (no Azure AD), with local caching.
 # • Live is REQUIRED (category + SKU mapping) but user can upload a different Live manually.
 # • Parts workbook sheets (exact): F2P, Cosmetic Category, Pricelist, UPH, Purchase Price.
-# • Live workbook sheet preference: "Inventory" (else Handset → Raw Data → first sheet).
+# • Live workbook sheet preference: "Inventory" (else contains 'inventory' → Handset → Raw Data → first sheet).
 # • LCD labor adder: +45 min only for C0/C2-C when there’s NO explicit LCD failure token.
 # • Grade B cosmetics = adhesives only; B ignored (N/A) for {C0,C1,C3,C3-BG,C2-BG}.
 # • CSV includes parts breakdown columns.
 #
-# Streamlit secrets/env:
-#   PARTS_PUBLIC_URL   = <public direct download to parts xlsx>
-#   LIVE_PUBLIC_URL    = <public direct download to AS (1).xlsx>
-#   HTTP_TTL           = "900" (optional seconds)
-#   BB360_DATA_ROOT    = "/tmp/bb360-data" (optional; good default on Streamlit Cloud)
+# Streamlit secrets/env (Cloud: use Secrets; Local: set env vars or put files under DATA_ROOT):
+#   PARTS_PUBLIC_URL   = <public direct download to parts xlsx>     (optional)
+#   LIVE_PUBLIC_URL    = <public direct download to AS.xlsx>        (optional)
+#   HTTP_TTL           = "900"                                      (optional seconds)
+#   BB360_DATA_ROOT    = "/tmp/bb360-data"                          (Cloud default)
+#     - On Windows localhost, you can point to your OneDrive DATA folder, e.g.:
+#       BB360_DATA_ROOT="C:\\Users\\Ecotec\\OneDrive - Ecotec Star FZCO\\Documents\\DATA"
 #
 # Local auto-discovery (newest-first):
 #   DATA_ROOT/parts/*.xlsx   and APP_DIR/parts/*parts*.xlsx
-#   DATA_ROOT/AS (1).xlsx    or APP_DIR/AS (1).xlsx or */live/AS (1).xlsx
+#   DATA_ROOT/AS.xlsx        or APP_DIR/AS.xlsx or */live/AS.xlsx
 #
 # UI:
 #   - Upload BB360 export (CSV/Excel) [required]
@@ -33,6 +35,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 import requests
+import math
 
 # -------------------- Cloud-aware DATA_ROOT --------------------
 def _on_streamlit_cloud() -> bool:
@@ -42,6 +45,8 @@ APP_DIR = Path(__file__).resolve().parent
 if _on_streamlit_cloud():
     DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", "/tmp/bb360-data")).resolve()
 else:
+    # Set BB360_DATA_ROOT to your actual OneDrive DATA folder if you want:
+    # e.g. BB360_DATA_ROOT="C:\\Users\\Ecotec\\OneDrive - Ecotec Star FZCO\\Documents\\DATA"
     DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", APP_DIR / "data")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -59,14 +64,18 @@ DEFAULTS = {
         ],
         # Live supports XLSX/XLS/CSV only
         "live_globs": [
+            # Prefer AS.xlsx in common spots
+            "live/AS.xlsx", "data/live/AS.xlsx",
+            "AS.xlsx", "data/AS.xlsx",
+            # still allow other names/types as fallback
             "live/*.xlsx", "live/*.csv",
             "data/live/*.xlsx", "data/live/*.csv",
             "*live*.xlsx", "*live*.csv",
         ],
     },
     "live": {
-        "default_path": "",
-        "require": True,   # <<< per your answer: Live is required
+        "default_path": "",   # you can hardcode a full path here if desired
+        "require": True,      # Live is REQUIRED
         "glob_paths": [],
     }
 }
@@ -93,7 +102,7 @@ def load_config():
 CFG = load_config()
 
 # -------------------- Page --------------------
-st.set_page_config(page_title='BB360: Clean Business View (r6d-nojson)', layout='wide')
+st.set_page_config(page_title='BB360: Clean Business View (r6d-nojson AS.xlsx)', layout='wide')
 st.title('BB360: Refurb Cost & Margins — Clean Business View (r6d-nojson)')
 
 # -------------------- HTTP pull (public links) --------------------
@@ -102,7 +111,18 @@ LIVE_PUBLIC_URL  = os.environ.get("LIVE_PUBLIC_URL", "").strip()
 HTTP_TTL = int(os.environ.get("HTTP_TTL", "900"))  # seconds
 
 PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")   # parts workbook (xlsx)
-LIVE_TARGET  = (DATA_ROOT / "AS (1).xlsx")                      # Live workbook exact name
+LIVE_TARGET  = (DATA_ROOT / "AS.xlsx")                          # Live workbook exact name
+
+def _normalize_dl_url(url: str) -> str:
+    """Try to coerce OneDrive/SharePoint view links to direct-download."""
+    if not url:
+        return url
+    u = url
+    # Common cases: add or force ?download=1
+    if "download=1" not in u.lower():
+        joiner = "&" if "?" in u else "?"
+        u = f"{u}{joiner}download=1"
+    return u
 
 def _fresh_enough(path: Path, ttl: int) -> bool:
     try:
@@ -113,13 +133,28 @@ def _fresh_enough(path: Path, ttl: int) -> bool:
 def _http_download(url: str, dest: Path):
     if not url:
         return False
+    url = _normalize_dl_url(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, allow_redirects=True, stream=True, timeout=60) as r:
         r.raise_for_status()
+        # Basic guard: avoid caching HTML error pages
+        ct = r.headers.get("Content-Type","").lower()
+        if "text/html" in ct:
+            raise ValueError("Remote server returned HTML, not a file (check if link is public-direct with download=1).")
+        # Write
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1<<20):
                 if chunk:
                     f.write(chunk)
+    # Quick signature check for xlsx (zip: "PK")
+    try:
+        with open(dest, "rb") as rf:
+            sig = rf.read(2)
+        if sig != b"PK":
+            # not fatal, but likely wrong content
+            st.warning(f"Downloaded file at {dest} doesn't look like an XLSX (no 'PK' header).")
+    except Exception:
+        pass
     return True
 
 def pull_http_public_files_if_needed():
@@ -228,7 +263,7 @@ def _read_parts_bundle_any(file_obj_or_path: str | os.PathLike, name_hint: str =
 
 # -------- Live reader (CSV/Excel only) --------
 def _read_live_any(file_obj_or_path, name_hint: str = ""):
-    # Prefer "Inventory" → else Handset → Raw Data → first sheet
+    # Prefer "Inventory" → else contains 'inventory' → Handset → Raw Data → first sheet
     name_low = (name_hint or str(file_obj_or_path)).lower()
 
     def _pick_sheet(xls: pd.ExcelFile):
@@ -300,11 +335,12 @@ def _pick_parts_path():
     return hits[0] if hits else None
 
 def _find_as_xlsx():
+    # Prefer a file literally named 'AS.xlsx' in common locations
     for p in [
-        APP_DIR / "AS (1).xlsx",
-        DATA_ROOT / "AS (1).xlsx",
-        APP_DIR / "live" / "AS (1).xlsx",
-        DATA_ROOT / "live" / "AS (1).xlsx",
+        APP_DIR / "AS.xlsx",
+        DATA_ROOT / "AS.xlsx",
+        APP_DIR / "live" / "AS.xlsx",
+        DATA_ROOT / "live" / "AS.xlsx",
     ]:
         if p.exists() and p.is_file():
             return str(p.resolve())
@@ -387,7 +423,7 @@ st.caption(f"Live source:  {LIVE_SOURCE}")
 # Enforce Live presence (required)
 if (as_inv is None or as_inv.empty) and CFG.get("live", {}).get("require", True):
     st.error("Live file is required but none was found.\n"
-             "Set LIVE_PUBLIC_URL, place AS (1).xlsx in data/ or app folder, define live.default_path in config.yml, or upload a file.")
+             "Set LIVE_PUBLIC_URL, place AS.xlsx in data/ or app folder, define live.default_path in config.yml, or upload a file.")
     st.stop()
 
 # -------------------- Constants / Maps --------------------
@@ -417,11 +453,9 @@ def build_purchase_index(purchase_price_df: pd.DataFrame) -> dict:
 
     def _find_col(cols, needles):
         lc = {str(c).strip().lower(): c for c in cols}
-        # exact
         for n0 in needles:
             if n0 in lc:
                 return lc[n0]
-        # substring
         for low, orig in lc.items():
             for n0 in needles:
                 if n0 in low:
@@ -479,8 +513,9 @@ def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
                           .replace({'nan': '', 'None': ''}, regex=False)
                           .agg('|'.join, axis=1)
                           .str.replace(r'\|+', '|', regex=True)
-                          .str.strip('| '))
-                normalized[key] = merged.mask(merged.eq(''))
+                          .str.strip('| ')) \
+                          .replace('', pd.NA)
+                normalized[key] = merged
             else:
                 normalized[key] = pd.NA
         else:
@@ -504,7 +539,6 @@ norm = normalize_input_df(df_raw)
 
 # -------------------- Live merge (REQUIRED; upload overrides auto) --------------------
 if as_inv is None or as_inv.empty:
-    # If Live is required, we already stopped above. If not required, you could pass-through here.
     merged = norm.copy()
     merged['Category'] = 'No Category'
     merged['SKU'] = ''
@@ -664,7 +698,7 @@ def select_cosmetic_breakdown_grade_A(model, cat_val):
                 cond = (((model_slice['Part_norm'].str.contains("BACKGLASS", na=False)) |
                         (model_slice['Part_norm'].str.contains("BACK", na=False) &
                          model_slice['Part_norm'].str.contains("GLASS", na=False))) &
-                        ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
+                         ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
             else:
                 cond = (model_slice['Part_norm'].str.contains("BACK COVER", na=False) &
                         ~model_slice['Part_norm'].str.contains("ADHESIVE", na=False))
@@ -694,9 +728,22 @@ uph_tbl['Defect_norm'] = uph_tbl['Type of Defect'].map(uph_key)
 uph_tbl['Ave. Repair Time (Mins)'] = pd.to_numeric(uph_tbl['Ave. Repair Time (Mins)'], errors='coerce').fillna(0.0)
 UPH_INDEX = dict(zip(uph_tbl['Defect_norm'], uph_tbl['Ave. Repair Time (Mins)']))
 
-def parse_failures(summary: str):
-    if not summary or str(summary).lower() == 'nan': return []
-    return [f.strip() for f in str(summary).split('|') if f.strip()]
+# --- NA-safe failures parser ---
+
+def parse_failures(summary):
+    # Treat None / NaN / pd.NA / empty strings as "no failures"
+    if summary is None:
+        return []
+    # pd.isna handles float('nan'), np.nan, pd.NA, NaT, etc.
+    if pd.isna(summary):
+        return []
+    s = str(summary).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return []
+    # Split on '|' and strip each token; drop empties
+    parts = [p.strip() for p in s.split("|")]
+    return [p for p in parts if p]
+
 
 def battery_status(cycle, health):
     try: cycle_num = float(cycle) if pd.notna(cycle) else None
