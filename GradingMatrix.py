@@ -36,13 +36,54 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", APP_DIR / "data")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Default configuration (fallback) — ensures CFG is always defined for checks later in the code.
+# Users can optionally override via BB360_CFG_JSON env var (JSON string) or a bb360_config.yaml file
+# placed in DATA_ROOT or APP_DIR. Only top-level keys are merged here for simplicity.
+CFG = {
+    "live": {"require": False},
+    "labor": {"ceq_minutes": 2},
+    "ui": {"hide_ipads_on_screen": True},
+}
+try:
+    # env override: JSON string
+    cfg_env = os.environ.get("BB360_CFG_JSON")
+    if cfg_env:
+        try:
+            loaded = json.loads(cfg_env)
+            if isinstance(loaded, dict):
+                for k, v in loaded.items():
+                    CFG[k] = v
+        except Exception:
+            pass
+
+    # file override: YAML in data or app dir
+    cfg_file = DATA_ROOT / "bb360_config.yaml"
+    if not cfg_file.exists():
+        cfg_file = APP_DIR / "bb360_config.yaml"
+    if cfg_file.exists():
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as fh:
+                y = yaml.safe_load(fh) or {}
+            if isinstance(y, dict):
+                for k, v in y.items():
+                    CFG[k] = v
+        except Exception:
+            pass
+except Exception:
+    # Keep defaults if anything goes wrong
+    pass
+
 PARTS_PUBLIC_URL = os.environ.get("PARTS_PUBLIC_URL", "").strip()
 LIVE_PUBLIC_URL  = os.environ.get("LIVE_PUBLIC_URL", "").strip()
 HTTP_TTL         = int(os.environ.get("HTTP_TTL", "900"))
 
-# HTTP download targets (keep names consistent with finders)
-PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")   # change to .json if you serve JSON
-LIVE_TARGET  = (DATA_ROOT / "AS (1).xlsx")                      # ← important: (1)
+# ───────────────────────────────────────────────────────────────────────────────
+# HTTP downloader + robust file sniffing for parts/live
+# ───────────────────────────────────────────────────────────────────────────────
+import requests, time, mimetypes
+
+PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")   # keep .xlsx; we sniff anyway
+LIVE_TARGET  = (DATA_ROOT / "AS (1).xlsx")
 
 def _fresh_enough(path: Path, ttl: int) -> bool:
     try:
@@ -50,133 +91,80 @@ def _fresh_enough(path: Path, ttl: int) -> bool:
     except Exception:
         return False
 
-def _http_download(url: str, dest: Path):
+def _is_probably_xlsx(path: Path) -> bool:
+    """True if file looks like an XLSX (zip header 'PK\\x03\\x04')."""
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(4)
+        return sig == b"PK\x03\x04"
+    except Exception:
+        return False
+
+def _is_probably_json(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096).lstrip()
+        return head.startswith(b"{") or head.startswith(b"[")
+    except Exception:
+        return False
+
+def _http_download_verified(url: str, dest: Path, label: str):
+    """
+    Download URL to dest; if HTML or empty, raise with guidance.
+    We do not try to auto-convert sharing links; ask user to supply a direct download link.
+    """
+    if not url:
+        return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, allow_redirects=True, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1<<20):
-                if chunk: f.write(chunk)
+
+    try:
+        with requests.get(url, allow_redirects=True, stream=True, timeout=60) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            r.raise_for_status()
+            # write
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        f.write(chunk)
+        # quick sanity: reject HTML/text “files”
+        if _is_probably_xlsx(tmp) or _is_probably_json(tmp):
+            tmp.replace(dest)
+            return True
+        else:
+            # Also reject text/html or small text payloads
+            try:
+                with open(tmp, "rb") as f:
+                    sample = f.read(200).decode("utf-8", errors="ignore")
+            except Exception:
+                sample = ""
+            tmp.unlink(missing_ok=True)
+            raise ValueError(
+                f"{label} download did not return a valid Excel/JSON file. "
+                f"Content-Type was '{ctype}'. Sample: {sample[:120]!r}. "
+                "Please use a **direct download** link (OneDrive: use the link with 'download=1' or 'redir?resid=...&download=1')."
+            )
+    except Exception as e:
+        # keep dest untouched if present
+        raise
 
 def pull_http_public_files_if_needed():
+    # Parts
     if PARTS_PUBLIC_URL and not _fresh_enough(PARTS_TARGET, HTTP_TTL):
-        try: _http_download(PARTS_PUBLIC_URL, PARTS_TARGET)
-        except Exception as e: st.warning(f"HTTP parts pull failed: {e}")
-    if LIVE_PUBLIC_URL and not _fresh_enough(LIVE_TARGET, HTTP_TTL):
-        try: _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
-        except Exception as e: st.warning(f"HTTP live pull failed: {e}")
-
-# ───────────────────────────────────────────────────────────────────────────────
-# UI
-# ───────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title='BB360: Clean Business View (r7)', layout='wide')
-st.title('BB360: Refurb Cost & Margins — Clean Business View (r7)')
-
-DEFAULTS = {
-    "ui": {"hide_ipads_on_screen": True},
-    "pricing": {"battery_default": "BATTERY CELL", "lcd_default": "LCM GENERIC (HARD OLED)"},
-    "labor": {"ceq_minutes": 2, "use_qc_labor": True},
-    "auto_sources": {
-        "parts_globs": ["parts/*.json","parts/*.xlsx","data/parts/*.json","data/parts/*.xlsx","*.parts.json","*parts*.xlsx"],
-        "live_globs":  ["live/*.json","live/*.xlsx","live/*.csv","data/live/*.json","data/live/*.xlsx","data/live/*.csv","*live*.json","*live*.xlsx","*live*.csv"],
-    },
-    "live": {"default_path": "", "require": False, "glob_paths": []}
-}
-
-def load_config():
-    p = APP_DIR / "config.yml"
-    if p.exists():
         try:
-            with open(p, "r", encoding="utf-8") as f: user = yaml.safe_load(f) or {}
-        except Exception:
-            user = {}
-    else:
-        user = {}
-    cfg = DEFAULTS.copy()
-    # shallow merge
-    for k, v in user.items():
-        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-            tmp = cfg[k].copy(); tmp.update(v); cfg[k] = tmp
-        else:
-            cfg[k] = v
-    return cfg
-
-CFG = load_config()
+            _http_download_verified(PARTS_PUBLIC_URL, PARTS_TARGET, "Parts")
+        except Exception as e:
+            st.error(f"HTTP parts pull failed: {e}")
+    # Live
+    if LIVE_PUBLIC_URL and not _fresh_enough(LIVE_TARGET, HTTP_TTL):
+        try:
+            _http_download_verified(LIVE_PUBLIC_URL, LIVE_TARGET, "Live (AS (1).xlsx)")
+        except Exception as e:
+            st.error(f"HTTP live pull failed: {e}")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# File discovery
+# Parts / Live readers — now with file sniffing
 # ───────────────────────────────────────────────────────────────────────────────
-AUTO_SOURCES = {
-    "parts_globs": CFG.get("auto_sources", {}).get("parts_globs", DEFAULTS["auto_sources"]["parts_globs"]),
-    "live_globs":  CFG.get("auto_sources", {}).get("live_globs",  DEFAULTS["auto_sources"]["live_globs"]),
-}
-LIVE_CFG = {
-    "default_path": str(CFG.get("live", {}).get("default_path", "")),
-    "require": bool(CFG.get("live", {}).get("require", False)),
-    "glob_paths": CFG.get("live", {}).get("glob_paths") or AUTO_SOURCES["live_globs"],
-}
-
-def _expand_globs(patterns):
-    results = []
-    for pat in patterns:
-        for base in (APP_DIR, DATA_ROOT):
-            for p in glob.glob(str((base / pat))):
-                try:
-                    if Path(p).is_file():
-                        results.append(str(Path(p).resolve()))
-                except Exception:
-                    pass
-    uniq = {}
-    for p in results:
-        try: uniq[p] = os.path.getmtime(p)
-        except Exception: uniq[p] = 0
-    return [k for k,_ in sorted(uniq.items(), key=lambda kv: kv[1], reverse=True)]
-
-def _pick_parts_path():
-    hits = _expand_globs(AUTO_SOURCES["parts_globs"])
-    return hits[0] if hits else (str(PARTS_TARGET) if PARTS_TARGET.exists() else None)
-
-def _find_as_xlsx():
-    # prefer AS (1).xlsx
-    for p in [
-        APP_DIR / "AS (1).xlsx",
-        DATA_ROOT / "AS (1).xlsx",
-        APP_DIR / "live" / "AS (1).xlsx",
-        DATA_ROOT / "live" / "AS (1).xlsx",
-    ]:
-        if p.exists() and p.is_file():
-            return str(p.resolve())
-    return None
-
-def _pick_live_path():
-    pref = _find_as_xlsx()
-    if pref: return pref
-    dp = LIVE_CFG.get("default_path", "").strip()
-    if dp:
-        p = Path(dp)
-        if p.exists() and p.is_file():
-            return str(p.resolve())
-    hits = _expand_globs(LIVE_CFG["glob_paths"])
-    if hits: return hits[0]
-    return str(LIVE_TARGET) if LIVE_TARGET.exists() else None
-
-# ───────────────────────────────────────────────────────────────────────────────
-# Parsers
-# ───────────────────────────────────────────────────────────────────────────────
-def keyify(s: str) -> str: return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
-def uph_key(name: str) -> str: return re.sub(r'[^a-z0-9]+', '', str(name).lower())
-
-def normalize_model(model_str):
-    if pd.isna(model_str): return ''
-    model = str(model_str).upper().strip()
-    model = re.sub(r'\s+',' ', model)
-    model = re.sub(r'[\(\)]','', model)
-    model = re.sub(r'\bSE\s*22\b', 'SE 2022', model)
-    model = re.sub(r'\bSE\s*20\b', 'SE 2020', model)
-    if 'SEGEN3' in model or 'SE 3' in model or '3RD GEN' in model: return 'IPHONE SE 2022'
-    if 'SEGEN2' in model or 'SE 2' in model or '2ND GEN' in model: return 'IPHONE SE 2020'
-    return model
-
 def _read_json_bundle(stream_or_path):
     close_me = None
     if isinstance(stream_or_path, (str, os.PathLike)):
@@ -187,12 +175,17 @@ def _read_json_bundle(stream_or_path):
         raw = json.load(stream)
     finally:
         if close_me: close_me.close()
-    if not isinstance(raw, dict): raise ValueError("Parts JSON must be an object with the 5 arrays.")
+    if not isinstance(raw, dict):
+        raise ValueError("Parts JSON must be an object with the 5 arrays (F2P, Cosmetic Category, Pricelist, UPH, Purchase Price).")
     def _df(key):
         if key not in raw or not isinstance(raw[key], list):
             raise ValueError(f"Parts JSON missing array '{key}'")
         return pd.DataFrame(raw[key])
-    return (_df("F2P"), _df("Cosmetic Category"), _df("Pricelist"), _df("UPH"), _df("Purchase Price"))
+    return (_df("F2P"),
+            _df("Cosmetic Category"),
+            _df("Pricelist"),
+            _df("UPH"),
+            _df("Purchase Price"))
 
 def _norm_sheet_map(names):
     def _n(s): return re.sub(r'[^a-z0-9]+','', str(s).lower())
@@ -225,37 +218,56 @@ def _read_sheet_any(xls: pd.ExcelFile, aliases, required=True, allow_substring=T
 FAIL_SOFT_PURCHASE = True
 
 def _read_parts_bundle_any(file_obj_or_path: str | os.PathLike):
-    name = str(file_obj_or_path).lower()
-    if name.endswith(".json"):
-        return _read_json_bundle(file_obj_or_path)
-    xls = pd.ExcelFile(file_obj_or_path)
-    # aliases
-    F2P_ALIASES        = ["F2P","FaultsToParts","F2P Mapping","F2P_Map","F2P Sheet","Faults→Parts"]
-    COSMETIC_ALIASES   = ["Cosmetic Category","Cosmetics","Cosmetic","CosmeticCategory","Cosmetic Cat","Cosmetic-Cat"]
-    PRICELIST_ALIASES  = ["Pricelist","Price List","Parts Price","Part Prices","Parts Pricelist","Price_List"]
-    UPH_ALIASES        = ["UPH","Labor","Repair Times","Ave. Repair Time","UPH Table","UPH Mapping"]
-    PURCHASE_ALIASES   = ["Purchase Price","Acquisition","Acquisition price","Buy Price","PurchasePrice","Acq Price"]
+    """
+    Robust reader:
+    - If real XLSX (zip signature), read via ExcelFile + tolerant sheet matching.
+    - Else if JSON, read JSON bundle (object with 5 arrays).
+    - Else: raise with a helpful message.
+    """
+    path = Path(file_obj_or_path)
+    # sniff instead of trusting extension
+    if _is_probably_xlsx(path):
+        xls = pd.ExcelFile(path)
+        F2P_ALIASES        = ["F2P","FaultsToParts","F2P Mapping","F2P_Map","F2P Sheet","Faults→Parts"]
+        COSMETIC_ALIASES   = ["Cosmetic Category","Cosmetics","Cosmetic","CosmeticCategory","Cosmetic Cat","Cosmetic-Cat"]
+        PRICELIST_ALIASES  = ["Pricelist","Price List","Parts Price","Part Prices","Parts Pricelist","Price_List"]
+        UPH_ALIASES        = ["UPH","Labor","Repair Times","Ave. Repair Time","UPH Table","UPH Mapping"]
+        PURCHASE_ALIASES   = ["Purchase Price","Acquisition","Acquisition price","Buy Price","PurchasePrice","Acq Price"]
 
-    f2p_parts      = _read_sheet_any(xls, F2P_ALIASES,       required=True,  warn_name="F2P")
-    cosmetic_cat   = _read_sheet_any(xls, COSMETIC_ALIASES,  required=True,  warn_name="Cosmetic Category")
-    pricelist      = _read_sheet_any(xls, PRICELIST_ALIASES, required=True,  warn_name="Pricelist")
-    uph            = _read_sheet_any(xls, UPH_ALIASES,       required=True,  warn_name="UPH")
-    try:
-        purchase_price = _read_sheet_any(xls, PURCHASE_ALIASES, required=not FAIL_SOFT_PURCHASE, warn_name="Purchase Price")
-    except ValueError as e:
-        if FAIL_SOFT_PURCHASE:
-            st.warning("Purchase Price sheet not found. Created an empty table (all prices=0).")
-            purchase_price = pd.DataFrame({"SKU": [], "Acquisition price": [], "Grade A": [], "Grade B": [], "Grade C": []})
-        else:
-            raise
-    return f2p_parts, cosmetic_cat, pricelist, uph, purchase_price
+        f2p_parts      = _read_sheet_any(xls, F2P_ALIASES,       required=True,  warn_name="F2P")
+        cosmetic_cat   = _read_sheet_any(xls, COSMETIC_ALIASES,  required=True,  warn_name="Cosmetic Category")
+        pricelist      = _read_sheet_any(xls, PRICELIST_ALIASES, required=True,  warn_name="Pricelist")
+        uph            = _read_sheet_any(xls, UPH_ALIASES,       required=True,  warn_name="UPH")
+        try:
+            purchase_price = _read_sheet_any(xls, PURCHASE_ALIASES, required=not FAIL_SOFT_PURCHASE, warn_name="Purchase Price")
+        except ValueError as e:
+            if FAIL_SOFT_PURCHASE:
+                st.warning("Purchase Price sheet not found. Created an empty table (all prices=0).")
+                purchase_price = pd.DataFrame({"SKU": [], "Acquisition price": [], "Grade A": [], "Grade B": [], "Grade C": []})
+            else:
+                raise
+        return f2p_parts, cosmetic_cat, pricelist, uph, purchase_price
+
+    if _is_probably_json(path):
+        return _read_json_bundle(path)
+
+    # if we get here, it's likely an HTML landing page or a wrong file
+    with open(path, "rb") as f:
+        head = f.read(160).decode("utf-8", errors="ignore")
+    raise ValueError(
+        f"Parts file is not a valid Excel or JSON bundle. First bytes looked like: {head[:120]!r}. "
+        "If you are using OneDrive, make sure the link is a **direct download** (includes 'download=1')."
+    )
 
 def _read_live_any(path_or_file, name_hint: str = ""):
+    # unchanged logic from r7 — left as-is
     name_low = (name_hint or str(path_or_file)).lower()
     if isinstance(path_or_file, (str, os.PathLike)):
         p = str(path_or_file)
         if p.lower().endswith(".csv"):  return pd.read_csv(p), os.path.basename(p)
         if p.lower().endswith((".xlsx",".xls")):
+            if not _is_probably_xlsx(Path(p)):
+                raise ValueError(f"Live file at '{p}' is not a valid Excel workbook. Supply a proper AS (1).xlsx.")
             xls = pd.ExcelFile(p)
             pick = None
             for s in xls.sheet_names:
@@ -280,7 +292,6 @@ def _read_live_any(path_or_file, name_hint: str = ""):
                 return pd.DataFrame([raw]), os.path.basename(p)+"[obj]"
         raise ValueError("Unsupported Live file extension.")
     else:
-        # uploads
         fn = name_hint.lower()
         if fn.endswith(".csv"):  return pd.read_csv(path_or_file), "(csv upload)"
         if fn.endswith((".xlsx",".xls")):
@@ -309,6 +320,7 @@ def _read_live_any(path_or_file, name_hint: str = ""):
                 return pd.DataFrame([raw]), "(json upload)[obj]"
         raise ValueError("Unsupported Live upload format.")
 
+
 # ───────────────────────────────────────────────────────────────────────────────
 # Inputs & autoload
 # ───────────────────────────────────────────────────────────────────────────────
@@ -316,6 +328,56 @@ uploaded     = st.file_uploader('Upload BB360 export (CSV / Excel / JSON)', type
 live_upload  = st.file_uploader('Upload Live file (optional; CSV / Excel / JSON). Leave empty to auto/pull.', type=['xlsx','xls','csv','json'])
 
 pull_http_public_files_if_needed()  # downloads if secrets set
+
+def _pick_parts_path():
+    # Prefer HTTP-downloaded file, then any .xlsx/.json in DATA_ROOT/parts
+    candidates = [
+        DATA_ROOT / "parts" / "parts-http.auto.xlsx",
+        DATA_ROOT / "parts" / "parts-http.auto.json"
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # Fallback: any .xlsx or .json in DATA_ROOT/parts
+    part_files = sorted((DATA_ROOT / "parts").glob("*.xlsx")) + sorted((DATA_ROOT / "parts").glob("*.json"))
+    if part_files:
+        return part_files[0]
+    return None
+
+def _pick_live_path():
+    """
+    Choose a live file path to use when the user did not upload one:
+    - Prefer the HTTP-downloaded LIVE_TARGET (AS (1).xlsx) if present.
+    - Prefer an AS (1).xlsx in DATA_ROOT or APP_DIR.
+    - Fall back to the first matching .xlsx/.csv/.json found in DATA_ROOT, then APP_DIR.
+    Returns a Path or None.
+    """
+    candidates = [
+        LIVE_TARGET,
+        DATA_ROOT / "AS (1).xlsx",
+        APP_DIR / "AS (1).xlsx"
+    ]
+    for c in candidates:
+        try:
+            if c and c.exists():
+                return c
+        except Exception:
+            continue
+
+    # Look for obvious AS files first, then any workbook/CSV/JSON in DATA_ROOT
+    patterns = ["AS*.xlsx", "*.xlsx", "*.csv", "*.json"]
+    for pat in patterns:
+        files = sorted(DATA_ROOT.glob(pat))
+        if files:
+            return files[0]
+
+    # Finally check the application directory
+    for pat in patterns:
+        files = sorted(APP_DIR.glob(pat))
+        if files:
+            return files[0]
+
+    return None
 
 @st.cache_data(show_spinner=False)
 def autoload_parts_and_live(live_upload):
@@ -444,6 +506,37 @@ if ar_col is not None:
     df_raw.drop(columns=['_a'], inplace=True, errors='ignore')
 
 norm = normalize_input_df(df_raw)
+
+# Helper normalizers (used throughout the module)
+def normalize_model(s):
+    """
+    Normalize a model string to an uppercase, single-spaced form suitable for indexing.
+    Keeps numeric model tokens and common separators normalized to a single space.
+    """
+    if s is None:
+        return ""
+    s = str(s).upper().strip()
+    # unify separators and collapse repeated whitespace
+    s = re.sub(r'[\s\-/\\]+', ' ', s)
+    return s
+
+def uph_key(s):
+    """
+    Normalization used for UPH defect keys: lowercase, remove non-alphanumerics.
+    This is used to build UPH_INDEX and to lookup defect repair times.
+    """
+    if s is None:
+        return ""
+    return re.sub(r'[^a-z0-9]+', '', str(s).lower())
+
+def keyify(s):
+    """
+    Create a compact uppercase key for parts (remove non-alphanumeric characters).
+    Matches how RE_KEYS and PL_RE_BY_MODEL are compared elsewhere in the code.
+    """
+    if s is None:
+        return ""
+    return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 
 # Live merge (optional)
 if as_inv is None or as_inv.empty:
