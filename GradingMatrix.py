@@ -35,6 +35,14 @@ import yaml
 import requests
 
 # -------------------- Cloud-aware DATA_ROOT --------------------
+# Add near the imports
+def _get_secret(name: str, default: str | None = None):
+    try:
+        import streamlit as _st
+        return os.environ.get(name) or _st.secrets.get(name, default)
+    except Exception:
+        return os.environ.get(name, default)
+
 def _on_streamlit_cloud() -> bool:
     return "/mount/src" in (os.environ.get("PWD", "") + os.environ.get("STREAMLIT_SERVER", ""))
 
@@ -101,7 +109,7 @@ PARTS_PUBLIC_URL = os.environ.get("PARTS_PUBLIC_URL", "").strip()
 LIVE_PUBLIC_URL  = os.environ.get("LIVE_PUBLIC_URL", "").strip()
 HTTP_TTL = int(os.environ.get("HTTP_TTL", "900"))  # seconds
 
-PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")   # parts workbook (xlsx)
+PARTS_TARGET = (DATA_ROOT / "pricing vs parts (1).xlsx" / "parts-http.auto.xlsx")   # parts workbook (xlsx)
 LIVE_TARGET  = (DATA_ROOT / "AS (1).xlsx")                      # Live workbook exact name
 
 def _fresh_enough(path: Path, ttl: int) -> bool:
