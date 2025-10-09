@@ -1,27 +1,34 @@
-# === BB360 APP — Clean Business View (Merged) — FULL r6c (HTTP + Cloud Safe) ===
+# === BB360 APP — Clean Business View (Merged) — FULL r6d ===
 # Date: 2025-10-09
 #
-# This build integrates:
-# • HTTPS pull for Parts + Live (prefers "AS (1).xlsx"; falls back to "AS.xlsx")
-# • Saves into DATA_ROOT (cloud-safe; defaults /tmp on Streamlit Cloud)
-# • LCD logic: +45 min tech labor only for C0/C2-C if NO explicit LCD failure token
-# • Grade B cosmetics = adhesives only; ignore B for {C0, C1, C3, C3-BG, C2-BG} and show N/A
-# • CSV includes parts breakdown
-# • Flexible sheet aliases for parts workbook (avoids “Purchase Price not found”)
-# • Live autoload: upload wins → AS (1).xlsx/AS.xlsx in known spots → config default → globs
-# • Cache keys include URLs and DATA_ROOT to avoid stale “no live” on Cloud
+# r6d highlights:
+# • Robust Purchase Price parsing (no KeyError if headers vary or are missing) via build_purchase_index(...).
+# • Live default file name is now "AS (1).xlsx" (auto-discovered & HTTP-pulled).
+# • HTTPS auto-pull for Parts + Live via public OneDrive/Share links (no Azure AD needed).
+# • Grade B cosmetics = ADHESIVES ONLY (reclaimed = $0), and B is ineligible (N/A) for {C0,C1,C3,C3-BG,C2-BG}.
+# • LCD tech-labor adder (+45 min) only when category is C0/C2-C AND no explicit LCD failure tokens exist.
+# • CSV includes parts breakdown: Functional, Cosmetic(A), Adhesives, Reglass type, Final parts used.
 #
-# Env variables / secrets (Streamlit Cloud: Settings → Secrets):
-#   PARTS_PUBLIC_URL   -> public link to parts workbook (xlsx or json bundle)
-#   LIVE_PUBLIC_URL    -> public link to AS (1).xlsx   (or AS.xlsx)
-#   HTTP_TTL           -> seconds to re-download if cached (default 900)
-#   BB360_DATA_ROOT    -> optional data folder (Cloud default: /tmp/bb360-data ; local default: ./data)
+# Environment variables (optional):
+#   PARTS_PUBLIC_URL   -> public HTTPS link to parts workbook (xlsx or JSON bundle)
+#   LIVE_PUBLIC_URL    -> public HTTPS link to "AS (1).xlsx"
+#   HTTP_TTL           -> seconds for cache freshness (default 900)
+#   BB360_DATA_ROOT    -> local data folder (default: ./data; on Streamlit Cloud: /tmp/bb360-data)
 #
-# Files created (if URLs set):
-#   DATA_ROOT/parts/parts-http.auto.xlsx   (or .json, if your bundle is JSON)
-#   DATA_ROOT/AS (1).xlsx                  (Live); also resolves AS.xlsx if that’s what you publish
+# Auto-discovery locations (searched newest-first):
+#   DATA_ROOT/parts/*.json|*.xlsx, APP_DIR/parts, *parts*.xlsx|*.json
+#   DATA_ROOT/live/*, APP_DIR/live/*, "*live*.*"
+#
+# App inputs:
+#   - BB360 export (upload; CSV/XLSX/JSON)  [required]
+#   - Live file (upload; optional)          [optional; else auto-discovered/pulled]
+#
+# Notes:
+#   - If Live not found and not required, we do a pass-through (no merge filter); set live.require=true in config.yml to enforce.
+#   - Set PARTS_PUBLIC_URL/LIVE_PUBLIC_URL to automatically pull the latest files to DATA_ROOT before discovery.
+#   - Keep your "Purchase Price" sheet headers flexible; the index builder tolerates many aliases.
 
-import os, re, json, glob, time
+import os, re, glob, json, time, hashlib
 from pathlib import Path
 from collections import defaultdict
 import html as _html
@@ -31,42 +38,18 @@ import streamlit as st
 import yaml
 import requests
 
-# -------------------- Cloud-safe base paths & secrets --------------------
-def _get_secret(name: str, default: str | None = None):
-    # Prefer real env var; fallback to st.secrets; else default
-    try:
-        return os.environ.get(name) or st.secrets.get(name, default)
-    except Exception:
-        return os.environ.get(name, default)
-
+# -------------------- Cloud-aware DATA_ROOT --------------------
 def _on_streamlit_cloud() -> bool:
-    # Heuristic that works in practice on Streamlit Cloud
     return "/mount/src" in (os.environ.get("PWD", "") + os.environ.get("STREAMLIT_SERVER", ""))
 
 APP_DIR = Path(__file__).resolve().parent
 if _on_streamlit_cloud():
-    DATA_ROOT = Path(_get_secret("BB360_DATA_ROOT", "/tmp/bb360-data")).resolve()
+    DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", "/tmp/bb360-data")).resolve()
 else:
-    DATA_ROOT = Path(_get_secret("BB360_DATA_ROOT", APP_DIR / "data")).resolve()
+    DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", APP_DIR / "data")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Public OneDrive (or any HTTPS) links
-PARTS_PUBLIC_URL = (_get_secret("PARTS_PUBLIC_URL", "") or "").strip()
-LIVE_PUBLIC_URL  = (_get_secret("LIVE_PUBLIC_URL", "") or "").strip()
-HTTP_TTL         = int(str(_get_secret("HTTP_TTL", "900")))
-
-# Targets for HTTP pulls
-PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")  # change to .json if your parts bundle is JSON
-LIVE_TARGETS = [
-    DATA_ROOT / "AS (1).xlsx",  # preferred naming per your environment
-    DATA_ROOT / "AS.xlsx",      # smart fallback if your link/file uses old name
-]
-
-# -------------------- Streamlit Page --------------------
-st.set_page_config(page_title='BB360: Clean Business View (r6c)', layout='wide')
-st.title('BB360: Refurb Cost & Margins — Clean Business View (r6c)')
-
-# -------------------- Config (optional config.yml) --------------------
+# -------------------- Config --------------------
 DEFAULTS = {
     "ui": {"hide_ipads_on_screen": True, "show_bucket_totals_in_summary": False},
     "pricing": {"battery_default": "BATTERY CELL", "lcd_default": "LCM GENERIC (HARD OLED)"},
@@ -81,7 +64,6 @@ DEFAULTS = {
             "live/*.json", "live/*.xlsx", "live/*.csv",
             "data/live/*.json", "data/live/*.xlsx", "data/live/*.csv",
             "*live*.json", "*live*.xlsx", "*live*.csv",
-            "*AS*.xlsx",
         ],
     },
     "live": {
@@ -91,7 +73,7 @@ DEFAULTS = {
     }
 }
 def load_config():
-    p = APP_DIR / "config.yml"
+    p = Path("config.yml")
     if p.exists():
         try:
             with open(p, "r", encoding="utf-8") as f:
@@ -103,23 +85,27 @@ def load_config():
     cfg = DEFAULTS.copy()
     for k, v in user.items():
         if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-            tmp = cfg[k].copy(); tmp.update(v); cfg[k] = tmp
+            tmp = cfg[k].copy()
+            tmp.update(v)
+            cfg[k] = tmp
         else:
             cfg[k] = v
     return cfg
+
 CFG = load_config()
 
-AUTO_SOURCES = {
-    "parts_globs": CFG.get("auto_sources", {}).get("parts_globs", DEFAULTS["auto_sources"]["parts_globs"]),
-    "live_globs":  CFG.get("auto_sources", {}).get("live_globs",  DEFAULTS["auto_sources"]["live_globs"]),
-}
-LIVE_CFG = {
-    "default_path": str(CFG.get("live", {}).get("default_path", "")),
-    "require": bool(CFG.get("live", {}).get("require", False)),
-    "glob_paths": CFG.get("live", {}).get("glob_paths") or AUTO_SOURCES["live_globs"],
-}
+# -------------------- Page --------------------
+st.set_page_config(page_title='BB360: Clean Business View (r6d)', layout='wide')
+st.title('BB360: Refurb Cost & Margins — Clean Business View (r6d)')
 
-# -------------------- HTTP puller --------------------
+# -------------------- HTTP pull (public links) --------------------
+PARTS_PUBLIC_URL = os.environ.get("PARTS_PUBLIC_URL", "").strip()
+LIVE_PUBLIC_URL  = os.environ.get("LIVE_PUBLIC_URL", "").strip()
+HTTP_TTL = int(os.environ.get("HTTP_TTL", "900"))  # seconds
+
+PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")  # if JSON bundle, change extension to .json
+LIVE_TARGET  = (DATA_ROOT / "AS (1).xlsx")                     # <— default AS filename requested
+
 def _fresh_enough(path: Path, ttl: int) -> bool:
     try:
         return path.exists() and (time.time() - path.stat().st_mtime) < ttl
@@ -133,32 +119,26 @@ def _http_download(url: str, dest: Path):
     with requests.get(url, allow_redirects=True, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
+            for chunk in r.iter_content(chunk_size=1<<20):
                 if chunk:
                     f.write(chunk)
     return True
 
 def pull_http_public_files_if_needed():
-    # Parts
     if PARTS_PUBLIC_URL:
         try:
             if not _fresh_enough(PARTS_TARGET, HTTP_TTL):
                 _http_download(PARTS_PUBLIC_URL, PARTS_TARGET)
         except Exception as e:
             st.warning(f"HTTP parts pull failed: {e}")
-
-    # Live — try to populate preferred name first; else fallback
     if LIVE_PUBLIC_URL:
         try:
-            # where to save based on URL hint
-            live_dest = LIVE_TARGETS[0] if "AS%20(1)" in LIVE_PUBLIC_URL or "(1)" in LIVE_PUBLIC_URL else LIVE_TARGETS[0]
-            # Always prefer saving to AS (1).xlsx, but we also check AS.xlsx later in discovery
-            if not any(_fresh_enough(p, HTTP_TTL) for p in LIVE_TARGETS):
-                _http_download(LIVE_PUBLIC_URL, live_dest)
+            if not _fresh_enough(LIVE_TARGET, HTTP_TTL):
+                _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
         except Exception as e:
             st.warning(f"HTTP live pull failed: {e}")
 
-# -------------------- Small helpers --------------------
+# -------------------- Utility helpers --------------------
 def keyify(s: str) -> str: return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 def uph_key(name: str) -> str: return re.sub(r'[^a-z0-9]+', '', str(name).lower())
 
@@ -193,9 +173,6 @@ def find_columns(df: pd.DataFrame, candidates: list):
                 hits.append(col_orig); seen.add(col_orig)
     return hits
 
-# -------------------- Flexible Parts Loader --------------------
-FAIL_SOFT = True  # synthesize empty Purchase Price if truly missing
-
 def _read_json_bundle(stream_or_path):
     close_me = None
     if isinstance(stream_or_path, (str, os.PathLike)):
@@ -205,14 +182,18 @@ def _read_json_bundle(stream_or_path):
     try:
         raw = json.load(stream)
     finally:
-        if close_me: stream.close()
+        if close_me: close_me.close()
     if not isinstance(raw, dict):
-        raise ValueError("Parts JSON must be an object with arrays for: F2P, Cosmetic Category, Pricelist, UPH, Purchase Price")
+        raise ValueError("Parts JSON must be an object with the 5 arrays.")
     def _df(key):
         if key not in raw or not isinstance(raw[key], list):
             raise ValueError(f"Parts JSON missing array '{key}'")
         return pd.DataFrame(raw[key])
-    return (_df("F2P"), _df("Cosmetic Category"), _df("Pricelist"), _df("UPH"), _df("Purchase Price"))
+    return (_df("F2P"),
+            _df("Cosmetic Category"),
+            _df("Pricelist"),
+            _df("UPH"),
+            _df("Purchase Price"))
 
 def _read_sheet_any(xls: pd.ExcelFile, aliases, required=True, allow_substring=True, warn_name=""):
     def _norm(s: str) -> str: return re.sub(r'[^a-z0-9]+', '', str(s).lower())
@@ -236,7 +217,11 @@ def _read_sheet_any(xls: pd.ExcelFile, aliases, required=True, allow_substring=T
                 if nk in k:
                     return pd.read_excel(xls, sheet_name=real)
     if required:
-        raise ValueError(f"Missing expected sheet. Looked for: {aliases}. Available: {available}")
+        raise ValueError(
+            "Missing expected sheet.\n"
+            f"Looked for: {aliases}\n"
+            f"Available: {available}"
+        )
     else:
         try: st.warning(f"Optional sheet '{warn_name or aliases[0]}' not found. Continuing empty.")
         except Exception: pass
@@ -256,20 +241,15 @@ def _read_parts_bundle_any(file_obj_or_path: str | os.PathLike, name_hint: str =
     cosmetic_cat   = _read_sheet_any(xls, COSMETIC_ALIASES,  required=True,  warn_name="Cosmetic Category")
     pricelist      = _read_sheet_any(xls, PRICELIST_ALIASES, required=True,  warn_name="Pricelist")
     uph            = _read_sheet_any(xls, UPH_ALIASES,       required=True,  warn_name="UPH")
+    # Purchase Price: soft-fail with empty table if missing
     try:
-        purchase_price = _read_sheet_any(xls, PURCHASE_ALIASES, required=not FAIL_SOFT, warn_name="Purchase Price")
-    except ValueError as e:
-        if FAIL_SOFT:
-            try:
-                st.error(str(e)); st.warning("Synthesizing empty Purchase Price table to continue.")
-            except Exception:
-                pass
-            purchase_price = pd.DataFrame({"SKU": [], "Acquisition price": [], "Grade A": [], "Grade B": [], "Grade C": []})
-        else:
-            raise
+        purchase_price = _read_sheet_any(xls, PURCHASE_ALIASES, required=True,  warn_name="Purchase Price")
+    except ValueError:
+        purchase_price = pd.DataFrame({"SKU": [], "Acquisition price": [], "Grade A": [], "Grade B": [], "Grade C": []})
+        try: st.warning("Purchase Price sheet not found. Created an empty table (all prices=0).")
+        except Exception: pass
     return f2p_parts, cosmetic_cat, pricelist, uph, purchase_price
 
-# -------------------- Live Reader & Autoload --------------------
 def _read_live_any(file_obj_or_path, name_hint: str = ""):
     name_low = (name_hint or str(file_obj_or_path)).lower()
     if isinstance(file_obj_or_path, (str, os.PathLike)):
@@ -279,8 +259,7 @@ def _read_live_any(file_obj_or_path, name_hint: str = ""):
             xls = pd.ExcelFile(file_obj_or_path)
             pick = None
             for s in xls.sheet_names:
-                low = s.lower()
-                if pick is None and "inventory" in low: pick = s
+                if pick is None and "inventory" in s.lower(): pick = s
             if pick is None:
                 for s in xls.sheet_names:
                     if "handset" in s.lower(): pick = s; break
@@ -320,7 +299,7 @@ def _read_live_any(file_obj_or_path, name_hint: str = ""):
             return pd.read_excel(xls, sheet_name=pick), f"(xlsx upload)[{pick}]"
         if name_low.endswith(".json"):
             try:
-                return (pd.read_json(file_obj_or_path, lines=True), "(jsonl upload)")
+                return pd.read_json(file_obj_or_path, lines=True), "(jsonl upload)"
             except Exception:
                 file_obj_or_path.seek(0)
                 raw = json.load(file_obj_or_path)
@@ -333,6 +312,17 @@ def _read_live_any(file_obj_or_path, name_hint: str = ""):
                     return pd.DataFrame([raw]), "(json upload)[obj]"
         raise ValueError("Unsupported Live upload format.")
 
+# -------------------- Autoload discovery --------------------
+AUTO_SOURCES = {
+    "parts_globs": CFG.get("auto_sources", {}).get("parts_globs", DEFAULTS["auto_sources"]["parts_globs"]),
+    "live_globs":  CFG.get("auto_sources", {}).get("live_globs",  DEFAULTS["auto_sources"]["live_globs"]),
+}
+LIVE_CFG = {
+    "default_path": str(CFG.get("live", {}).get("default_path", "")),
+    "require": bool(CFG.get("live", {}).get("require", False)),
+    "glob_paths": CFG.get("live", {}).get("glob_paths") or AUTO_SOURCES["live_globs"],
+}
+
 def _expand_globs(patterns):
     results = []
     for pat in patterns:
@@ -343,77 +333,83 @@ def _expand_globs(patterns):
                         results.append(str(Path(p).resolve()))
                 except Exception:
                     pass
-    uniq = {p: os.path.getmtime(p) if os.path.exists(p) else 0 for p in results}
+    uniq = {}
+    for p in results:
+        try:
+            uniq[p] = os.path.getmtime(p)
+        except Exception:
+            uniq[p] = 0
     return [k for k,_ in sorted(uniq.items(), key=lambda kv: kv[1], reverse=True)]
 
-def _find_live_preferred():
-    # Prefer AS (1).xlsx, then AS.xlsx; check in both DATA_ROOT and APP_DIR (and /live subdirs)
-    candidates = [
+def _pick_parts_path():
+    # Prefer HTTP-pulled file if present
+    if PARTS_TARGET.exists():
+        return str(PARTS_TARGET.resolve())
+    hits = _expand_globs(AUTO_SOURCES["parts_globs"])
+    return hits[0] if hits else None
+
+def _find_as_xlsx():
+    for p in [
+        APP_DIR / "AS (1).xlsx",
         DATA_ROOT / "AS (1).xlsx",
+        APP_DIR / "live" / "AS (1).xlsx",
         DATA_ROOT / "live" / "AS (1).xlsx",
-        APP_DIR   / "AS (1).xlsx",
-        APP_DIR   / "live" / "AS (1).xlsx",
-        DATA_ROOT / "AS.xlsx",
-        DATA_ROOT / "live" / "AS.xlsx",
-        APP_DIR   / "AS.xlsx",
-        APP_DIR   / "live" / "AS.xlsx",
-    ]
-    for p in candidates:
+    ]:
         if p.exists() and p.is_file():
             return str(p.resolve())
     return None
 
 def _pick_live_path():
-    # 1) Preferred fixed names
-    hit = _find_live_preferred()
-    if hit: return hit
-    # 2) config default_path
-    dp = (LIVE_CFG.get("default_path") or "").strip()
-    if dp and Path(dp).exists() and Path(dp).is_file():
-        return str(Path(dp).resolve())
-    # 3) newest from globs
+    # Prefer HTTP-pulled file if present
+    if LIVE_TARGET.exists():
+        return str(LIVE_TARGET.resolve())
+    as_pref = _find_as_xlsx()
+    if as_pref:
+        return as_pref
+    dp = LIVE_CFG.get("default_path", "").strip()
+    if dp:
+        p = Path(dp)
+        if p.exists() and p.is_file():
+            return str(p.resolve())
     hits = _expand_globs(LIVE_CFG["glob_paths"])
     return hits[0] if hits else None
 
-# -------------------- UI Inputs --------------------
+# -------------------- Inputs --------------------
 uploaded = st.file_uploader('Upload BB360 export (CSV / Excel / JSON)', type=['xlsx','xls','csv','json'])
-live_override = st.file_uploader('Upload Live file (optional). Leave empty to auto / HTTP pull.', type=['xlsx','xls','csv','json'])
+live_override = st.file_uploader('Upload Live file (optional; CSV / Excel / JSON). Leave empty to auto/pull.', type=['xlsx','xls','csv','json'])
 
-# Pull public links (no-op if empty)
+# Pull from public links if configured
 pull_http_public_files_if_needed()
 
 @st.cache_data(show_spinner=False)
-def autoload_parts_and_live(live_upload, parts_url: str, live_url: str, data_root: str):
-    # Parts
-    # Search newest in APP_DIR/DATA_ROOT per globs, including the HTTP target
-    parts_candidates = _expand_globs(AUTO_SOURCES["parts_globs"])
-    # Ensure HTTP target is considered first if present
-    if PARTS_TARGET.exists():
-        parts_candidates = [str(PARTS_TARGET.resolve())] + [p for p in parts_candidates if Path(p).resolve() != PARTS_TARGET.resolve()]
-    parts_path = parts_candidates[0] if parts_candidates else None
+def autoload_parts_and_live(live_upload):
+    # Parts bundle
+    parts_path = _pick_parts_path()
     if not parts_path:
         st.error(
             "Cannot find Parts bundle.\n"
-            "Place a parts workbook in APP_DIR/parts or DATA_ROOT/parts, or set PARTS_PUBLIC_URL."
+            "Place a parts workbook in:\n"
+            f"- {APP_DIR/'parts'} or {DATA_ROOT/'parts'}\n"
+            "Or set PARTS_PUBLIC_URL to auto-download.\n"
+            "Supported: JSON bundle (5 arrays) or Excel (5 sheets)."
         ); st.stop()
     f2p_parts, cosmetic_cat, pricelist, uph, purchase_price = _read_parts_bundle_any(parts_path)
     parts_label = f"{parts_path}"
 
-    # Live
+    # Live file
     if live_upload is not None:
-        as_inv, used = _read_live_any(live_upload, live_upload.name)
-        live_label = f"(upload) {live_upload.name}"
+        as_inv, live_label = _read_live_any(live_upload, live_upload.name)
+        live_abs_label = f"(upload) {live_label}"
     else:
-        # Prefer fixed-names including HTTP targets (AS (1).xlsx / AS.xlsx)
-        # If the HTTP pull wrote to DATA_ROOT/AS (1).xlsx or AS.xlsx, _pick_live_path will find it
         chosen = _pick_live_path()
         if chosen:
-            as_inv, used = _read_live_any(chosen, chosen)
-            live_label = chosen
+            as_inv, live_label = _read_live_any(chosen, chosen)
+            live_abs_label = chosen
         else:
             as_inv = pd.DataFrame()
-            live_label = "(no live found)"
-    return f2p_parts, cosmetic_cat, pricelist, uph, purchase_price, as_inv, parts_label, live_label
+            live_abs_label = "(no live found)"
+
+    return f2p_parts, cosmetic_cat, pricelist, uph, purchase_price, as_inv, parts_label, live_abs_label
 
 @st.cache_data(show_spinner=False)
 def load_bb360(uploaded_file):
@@ -436,20 +432,15 @@ def load_bb360(uploaded_file):
 if not uploaded:
     st.info('Upload the BB360 export to continue.'); st.stop()
 
-# Load sources (include URLs & DATA_ROOT in cache key to avoid stale cache on Cloud)
 df_raw = load_bb360(uploaded)
-f2p_parts, cosmetic_cat, pricelist, uph, purchase_price, as_inv, PARTS_SOURCE, LIVE_SOURCE = autoload_parts_and_live(
-    live_override, PARTS_PUBLIC_URL, LIVE_PUBLIC_URL, str(DATA_ROOT)
-)
-
-st.caption(f"DATA_ROOT = {DATA_ROOT}")
+f2p_parts, cosmetic_cat, pricelist, uph, purchase_price, as_inv, PARTS_SOURCE, LIVE_SHEET = autoload_parts_and_live(live_override)
 st.caption(f"Parts source: {PARTS_SOURCE}")
-st.caption(f"Live source:  {LIVE_SOURCE}")
+st.caption(f"Live source:  {LIVE_SHEET}")
 
-# Live required?
-if (as_inv is None or as_inv.empty) and LIVE_CFG.get("require", False):
-    st.error("Live file is required (live.require=true), but none was found.\n"
-             "Set LIVE_PUBLIC_URL, place 'AS (1).xlsx' in DATA_ROOT, set live.default_path, or upload a file.")
+# Enforce Live if configured
+if (as_inv is None or as_inv.empty) and CFG.get("live", {}).get("require", False):
+    st.error("Live file is required (live.require=true) but none was found.\n"
+             "Use LIVE_PUBLIC_URL, place AS (1).xlsx in data/, set live.default_path, or upload a file.")
     st.stop()
 
 # -------------------- Constants / Maps --------------------
@@ -468,6 +459,72 @@ ANODIZING_ELIGIBLE_MODELS = {"IPHONE SE","IPHONE SE 2020","IPHONE SE 2022","IPHO
 IGNORE_B_FOR_DECISION = {'C0', 'C1', 'C3', 'C3-BG', 'C2-BG'}
 LCD_CATEGORY_FALLBACK_MIN = 45.0
 _re_lcd = re.compile(r'(pixel\s*test|screen\s*burn|screen\s*test)', re.I)
+
+# -------------------- Robust Purchase Price index builder --------------------
+def build_purchase_index(purchase_price_df: pd.DataFrame) -> dict:
+    """
+    Tolerant parser for the Purchase Price sheet/table.
+    Returns: { SKU_UPPER: {acq: float, A: float, B: float, C: float}, ... }
+    """
+    if not isinstance(purchase_price_df, pd.DataFrame) or purchase_price_df.empty:
+        return {}
+
+    pp = purchase_price_df.copy()
+    pp.columns = [str(c).strip() for c in pp.columns]
+    n = len(pp)
+
+    def _find_col(cols, needles):
+        lc = {str(c).strip().lower(): c for c in cols}
+        # exact
+        for n0 in needles:
+            if n0 in lc:
+                return lc[n0]
+        # substring
+        for low, orig in lc.items():
+            for n0 in needles:
+                if n0 in low:
+                    return orig
+        return None
+
+    def _money_series(obj):
+        if isinstance(obj, pd.Series):
+            s = obj
+        else:
+            s = pd.Series(obj, index=range(n))
+        s = s.astype(str).str.replace(r'[^0-9\.]', '', regex=True).replace('', '0')
+        return pd.to_numeric(s, errors='coerce').fillna(0.0)
+
+    sku_col = _find_col(pp.columns, ["sku", "sku id", "sku name", "sku description"])
+    acq_col = _find_col(pp.columns, ["acquisition price", "acquisition", "buy price", "purchase price", "purchase", "acq"])
+    a_col   = _find_col(pp.columns, ["grade a price", "grade a", "a"])
+    b_col   = _find_col(pp.columns, ["grade b price", "grade b", "b"])
+    c_col   = _find_col(pp.columns, ["grade c price", "grade c", "c"])
+
+    PP_SKU         = (pp[sku_col].astype(str) if sku_col else pd.Series([""]*n))
+    PP_Acquisition = _money_series(pp[acq_col] if acq_col else 0)
+    PP_GradeA      = _money_series(pp[a_col]   if a_col   else 0)
+    PP_GradeB      = _money_series(pp[b_col]   if b_col   else 0)
+    PP_GradeC      = _money_series(pp[c_col]   if c_col   else 0)
+
+    if sku_col is None and n > 0:
+        try: st.warning("Purchase Price: no SKU column found; prices loaded but cannot be matched to SKUs.")
+        except Exception: pass
+
+    index = {}
+    for i in range(n):
+        sku = str(PP_SKU.iloc[i]).strip().upper()
+        if not sku:  # skip blanks
+            continue
+        index[sku] = {
+            "acq": float(PP_Acquisition.iloc[i]),
+            "A":   float(PP_GradeA.iloc[i]),
+            "B":   float(PP_GradeB.iloc[i]),
+            "C":   float(PP_GradeC.iloc[i]),
+        }
+    return index
+
+# Build the price index now (overwrites any prior simpler mapping)
+PURCHASE_INDEX = build_purchase_index(purchase_price)
 
 # -------------------- Normalize & Filter BB360 --------------------
 def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -506,81 +563,67 @@ norm = normalize_input_df(df_raw)
 
 # -------------------- Live merge (optional) --------------------
 if as_inv is None or as_inv.empty:
+    # Pass-through; no filtering by Live
     merged = norm.copy()
     merged['Category'] = merged.get('Category', pd.Series(['No Category'] * len(merged)))
     merged['SKU'] = merged.get('SKU', pd.Series([''] * len(merged)))
     merged['SKU_KEY'] = merged['_norm_model'].astype(str).str.upper().str.strip()
 else:
-    as_inv = as_inv.copy()
     as_inv.columns = [str(c).strip().lower() for c in as_inv.columns]
     imei_col = next((c for c in as_inv.columns if any(k in c for k in ["imei","sn","serial"])), None)
     cat_col  = next((c for c in as_inv.columns if "category" in c), None)
-
     def _find_live_col(substrs):
         for c in as_inv.columns:
             if any(s in str(c).lower() for s in substrs): return c
         return None
-
     sku_col        = _find_live_col(["sku","sku name","sku id","sku description"])
     live_model_col = _find_live_col(["model","device model","device"])
     color_col      = _find_live_col(["color","colour"])
     capacity_col   = _find_live_col(["capacity","storage","rom"])
 
-    # Guard: if no IMEI/SN column found, skip merge to avoid KeyError
-    if imei_col is None:
-        st.warning("Live file does not contain an IMEI/SN column. Skipping live merge.")
-        merged = norm.copy()
-        merged['Category'] = 'No Category'
-        merged['SKU'] = ''
-        merged['SKU_KEY'] = merged['_norm_model'].astype(str).str.upper().str.strip()
-    else:
-        norm['_norm_imei'] = norm['_norm_imei'].astype(str).str.strip()
-        as_inv[imei_col]   = as_inv[imei_col].astype(str).str.strip()
+    norm['_norm_imei'] = norm['_norm_imei'].astype(str).str.strip()
+    as_inv[imei_col]   = as_inv[imei_col].astype(str).str.strip()
 
-        live_cols = [c for c in [imei_col,cat_col,sku_col,live_model_col,color_col,capacity_col] if c]
-        merged = norm.merge(as_inv[live_cols], left_on='_norm_imei', right_on=imei_col, how='left', indicator=True)
-        merged = merged[merged['_merge']=='both'].copy().rename(columns={cat_col:'Category'}).drop(columns=[imei_col,'_merge'], errors='ignore')
-        merged['Category'] = merged['Category'].astype(str).str.strip().replace({'':'No Category','nan':'No Category','None':'No Category'})
+    live_cols = [c for c in [imei_col,cat_col,sku_col,live_model_col,color_col,capacity_col] if c]
+    merged = norm.merge(as_inv[live_cols], left_on='_norm_imei', right_on=imei_col, how='left', indicator=True)
+    merged = merged[merged['_merge']=='both'].copy().rename(columns={cat_col:'Category'}).drop(columns=[imei_col,'_merge'], errors='ignore')
+    merged['Category'] = merged['Category'].astype(str).str.strip().replace({'':'No Category','nan':'No Category','None':'No Category'})
 
-        merged['SKU'] = ''
-        if sku_col: merged['SKU'] = merged[sku_col].astype(str).str.strip()
-        fallback_model_series = merged[live_model_col] if (live_model_col and live_model_col in merged.columns) else merged['_norm_model']
-        cap_series = merged[capacity_col].astype(str) if (capacity_col and capacity_col in merged.columns) else ''
-        col_series = merged[color_col].astype(str) if (color_col and color_col in merged.columns) else ''
-        def _cap_norm(x: str) -> str:
-            s = str(x or '').strip()
-            if not s or s.lower() in ('nan','none'): return ''
-            m = re.search(r'(\d+)\s*(tb|gb|g|gig|gigabyte|gigabytes)?', s, re.I)
-            if m:
-                num = m.group(1); unit = (m.group(2) or 'GB').upper()
-                unit = 'TB' if unit.startswith('T') else 'GB'
-                return f"{num}{unit}"
-            return s.upper()
-        def _capwords(s: str) -> str:
-            s = str(s or '').strip()
-            if not s or s.lower() in ('nan','none'): return ''
-            return ' '.join(w.capitalize() for w in s.split())
-        built = (fallback_model_series.astype(str).str.upper().str.strip()
-                 + (' ' + pd.Series(cap_series).apply(_cap_norm)).replace(' ','',regex=False)
-                 + (' ' + pd.Series(col_series).apply(_capwords)).replace(' ','',regex=False)).str.strip()
-        merged['SKU'] = merged['SKU'].mask(merged['SKU'].eq('') | merged['SKU'].str.lower().isin(['nan','none']), built)
-        merged['SKU'] = merged['SKU'].mask(merged['SKU'].eq('') | merged['SKU'].str.lower().isin(['nan','none']), merged['_norm_model'].astype(str).str.upper().str.strip())
-        model_key_norm = (fallback_model_series.apply(normalize_model).astype(str).str.upper().str.strip())
-        merged['SKU_KEY'] = (model_key_norm + (' ' + pd.Series(cap_series).apply(_cap_norm)).replace(' ','',regex=False)).str.strip()
+    # Build SKU & SKU_KEY
+    merged['SKU'] = ''
+    if sku_col: merged['SKU'] = merged[sku_col].astype(str).str.strip()
+    fallback_model_series = merged[live_model_col] if (live_model_col and live_model_col in merged.columns) else merged['_norm_model']
+    cap_series = merged[capacity_col].astype(str) if (capacity_col and capacity_col in merged.columns) else ''
+    col_series = merged[color_col].astype(str) if (color_col and color_col in merged.columns) else ''
+    def _cap_norm(x: str) -> str:
+        s = str(x or '').strip()
+        if not s or s.lower() in ('nan','none'): return ''
+        m = re.search(r'(\d+)\s*(tb|gb|g|gig|gigabyte|gigabytes)?', s, re.I)
+        if m:
+            num = m.group(1); unit = (m.group(2) or 'GB').upper()
+            unit = 'TB' if unit.startswith('T') else 'GB'
+            return f"{num}{unit}"
+        return s.upper()
+    def _capwords(s: str) -> str:
+        s = str(s or '').strip()
+        if not s or s.lower() in ('nan','none'): return ''
+        return ' '.join(w.capitalize() for w in s.split())
+    built = (fallback_model_series.astype(str).str.upper().str.strip()
+             + (' ' + pd.Series(cap_series).apply(_cap_norm)).replace(' ','',regex=False)
+             + (' ' + pd.Series(col_series).apply(_capwords)).replace(' ','',regex=False)).str.strip()
+    merged['SKU'] = merged['SKU'].mask(merged['SKU'].eq('') | merged['SKU'].str.lower().isin(['nan','none']), built)
+    merged['SKU'] = merged['SKU'].mask(merged['SKU'].eq('') | merged['SKU'].str.lower().isin(['nan','none']), merged['_norm_model'].astype(str).str.upper().str.strip())
+    model_key_norm = (fallback_model_series.apply(normalize_model).astype(str).str.upper().str.strip())
+    merged['SKU_KEY'] = (model_key_norm + (' ' + pd.Series(cap_series).apply(_cap_norm)).replace(' ','',regex=False)).str.strip()
 
 # -------------------- Pricing normalization --------------------
-def keyify(s: str) -> str: return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
-
-cosmetic_cat = cosmetic_cat.copy()
 cosmetic_cat.columns = [str(c).strip() for c in cosmetic_cat.columns]
 CAT_TO_DESC = dict(zip(cosmetic_cat['Legacy Category'], cosmetic_cat['Description']))
 
-f2p_parts = f2p_parts.copy()
 f2p_parts['Model_norm']  = f2p_parts['iPhone Model'].apply(normalize_model)
 f2p_parts['Faults_norm'] = f2p_parts['Faults'].astype(str).str.lower().str.strip()
 f2p_parts['Part_norm']   = f2p_parts['Part'].astype(str).str.upper().str.strip().str.replace(r'\s+',' ',regex=True)
 
-pricelist = pricelist.copy()
 pricelist['Model_norm'] = pricelist['iPhone Model'].apply(normalize_model)
 pricelist['Part_norm']  = pricelist['Part'].astype(str).str.upper().str.strip().str.replace(r'\s+',' ',regex=True)
 pricelist['PRICE']      = pd.to_numeric(pricelist['PRICE'].astype(str).str.replace(r'[^0-9\.]','',regex=True).replace('','0'), errors='coerce').fillna(0.0)
@@ -696,37 +739,6 @@ def select_cosmetic_breakdown_grade_A(model, cat_val):
             dedup.append(p); seen.add(p)
     return total, dedup, adhs
 
-# -------------------- Purchase Price normalization --------------------
-purchase_price = purchase_price.copy()
-purchase_price.columns = [str(c).strip() for c in purchase_price.columns]
-pp_cols = purchase_price.columns
-col_map = {
-    "SKU": next((c for c in pp_cols if c.strip().lower() == "sku"), "SKU"),
-    "Acq": next((c for c in pp_cols if "acquisition" in c.strip().lower()), "Acquisition price"),
-    "A":   next((c for c in pp_cols if c.strip().lower() in ("grade a","grade a price","a")), purchase_price.columns[2] if len(purchase_price.columns)>2 else "Grade A"),
-    "B":   next((c for c in pp_cols if c.strip().lower() in ("grade b","grade b price","b")), purchase_price.columns[3] if len(purchase_price.columns)>3 else "Grade B"),
-    "C":   next((c for c in pp_cols if c.strip().lower() in ("grade c","grade c price","c")), purchase_price.columns[4] if len(purchase_price.columns)>4 else "Grade C"),
-}
-purchase_price.rename(columns={
-    col_map["SKU"]: "PP_SKU",
-    col_map["Acq"]: "PP_Acquisition",
-    col_map["A"]:   "PP_GradeA",
-    col_map["B"]:   "PP_GradeB",
-    col_map["C"]:   "PP_GradeC",
-}, inplace=True)
-for c in ["PP_Acquisition","PP_GradeA","PP_GradeB","PP_GradeC"]:
-    purchase_price[c] = pd.to_numeric(
-        purchase_price[c].astype(str).str.replace(r'[^0-9\.]','',regex=True).replace('','0'),
-        errors='coerce'
-    ).fillna(0.0)
-PURCHASE_INDEX = {
-    str(row["PP_SKU"]).strip().upper(): {
-        "acq": float(row["PP_Acquisition"]), "A": float(row["PP_GradeA"]),
-        "B": float(row["PP_GradeB"]), "C": float(row["PP_GradeC"])
-    }
-    for _, row in purchase_price.iterrows()
-}
-
 # -------------------- User selectors --------------------
 battery_type = st.selectbox("Battery Type", ["BATTERY CELL","BATTERY OEM","BATTERY OEM PULLED"], index=0).upper()
 lcd_type = st.selectbox("LCD Type", ["LCM GENERIC (HARD OLED)","LCM GENERIC (TFT)","LCM -OEM REFURBISHED (GLASS CHANGED -GENERIC)","LCM GENERIC (SOFT OLED)"], index=0).upper()
@@ -756,17 +768,17 @@ def battery_status(cycle, health):
 # -------------------- Core compute --------------------
 def compute_row(row, labor_rate):
     analyst_result = str(row.get('_norm_analyst_result', row.get('Analyst Result',''))).strip().lower()
-    if analyst_result == "not completed": return None
+    if analyst_result == "not completed":
+        return None
 
     failures = parse_failures(row.get('_norm_defects',''))
     batt_status, _, _ = battery_status(row.get('_norm_battery_cycle'), row.get('_norm_battery_health'))
-    model_raw = normalize_model(row.get('_norm_model'))
-    device_model = model_raw
+    device_model = normalize_model(row.get('_norm_model'))
     cat_val = str(row.get('Category') or '').strip().upper()
     sku_key = str(row.get('SKU_KEY') or '').strip().upper()
 
     lcd_failure_present = any(_re_lcd.search(str(f)) for f in failures)
-    lcd_needed = lcd_failure_present or (cat_val in {"C0", "C2-C"})
+    lcd_needed = lcd_failure_present or cat_val in {"C0", "C2-C"}
 
     # Functional parts
     func_parts, seen_fp = [], set()
@@ -778,7 +790,6 @@ def compute_row(row, labor_rate):
     for f in failures:
         for part in F2P_INDEX.get((device_model, str(f).lower().strip()), []):
             _add_fp(part)
-
     if batt_status == "Battery Service":
         _add_fp(battery_type)
         if battery_type == "BATTERY CELL":
@@ -787,30 +798,29 @@ def compute_row(row, labor_rate):
                 fx = model_slice[model_slice['Part_norm'].str.contains("BATTERY FLEX", na=False)]
                 if not fx.empty:
                     _add_fp(str(fx['Part_norm'].iat[0]).upper().strip())
-
     if lcd_needed:
         _add_fp(lcd_type)
 
     func_total = sum(float(PRICE_INDEX.get((device_model, k), 0.0)) for k in func_parts)
 
-    # Tech labor minutes
+    # Tech labor minutes (+CEQ if any failure)
     tech_minutes = sum(float(UPH_INDEX.get(uph_key(tok), 0.0)) for tok in failures)
     if failures:
         tech_minutes += float(CFG['labor'].get('ceq_minutes', 2))
-    # Category-only LCD adder (no double-count if explicit failure already present)
+    # Category LCD fallback: only if C0/C2-C and there is NOT already an LCD failure token
     if cat_val in {"C0", "C2-C"} and not lcd_failure_present:
-        tech_minutes += LCD_CATEGORY_FALLBACK_MIN
+        tech_minutes += LCD_CATEGORY_FALLBACK_MIN  # +45 min
     tech_labor_cost = (tech_minutes / 60.0) * float(labor_rate)
 
-    # Refurb labor
+    # Refurb labor (category)
     refcat_set = {'C0','C1','C3-BG','C3-HF','C3'}
     refurb_minutes = float(UPH_INDEX.get(uph_key(cat_val), 0.0)) if cat_val in refcat_set else 0.0
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
 
-    # Re-glass
+    # Re-glass (eligible cats only)
     RE_ELIGIBLE_CATS = {'C1','C2','C2-BG'}
     re_applicable = cat_val in RE_ELIGIBLE_CATS
-    has_mts = any("multitouchscreen" in str(f).lower().replace(" ","").replace("-","") for f in failures) if re_applicable else False
+    has_mts = any("multitouchscreen" in str(f).lower().replace(" ", "").replace("-", "") for f in failures) if re_applicable else False
     re_min_candidates = []
     if re_applicable:
         if has_mts:
@@ -833,10 +843,10 @@ def compute_row(row, labor_rate):
                  float(UPH_INDEX.get(uph_key("front polish"), 0.0)))
     bb_min = max(float(UPH_INDEX.get(uph_key("back buffing"), 0.0)),
                  float(UPH_INDEX.get(uph_key("back polish"), 0.0)))
-    if   cat_val in {'C4','C3-HF'}: bnp_minutes = fb_min + bb_min
+    if cat_val in {'C4','C3-HF'}: bnp_minutes = fb_min + bb_min
     elif cat_val in {'C3','C3-BG'}: bnp_minutes = fb_min
-    elif cat_val in {'C2','C2-C'}:  bnp_minutes = bb_min
-    else:                           bnp_minutes = 0.0
+    elif cat_val in {'C2','C2-C'}: bnp_minutes = bb_min
+    else: bnp_minutes = 0.0
     bnp_cost = (bnp_minutes / 60.0) * float(labor_rate) if bnp_minutes > 0 else 0.0
 
     anod_min = max(float(UPH_INDEX.get(uph_key("anodizing"), 0.0)),
@@ -861,14 +871,14 @@ def compute_row(row, labor_rate):
     margin_B = price_B - (acq + refurb_B)
     margin_C = price_C - (acq + refurb_C)
 
-    # Decision (ignore B for specific cats)
+    # Decision (B may be ineligible)
     b_ineligible = cat_val in IGNORE_B_FOR_DECISION
     candidates = [("A", price_A, margin_A, refurb_A), ("C", price_C, margin_C, refurb_C)]
     if not b_ineligible:
         candidates.append(("B", price_B, margin_B, refurb_B))
     best_grade, best_price, best_margin, best_refurb = max(candidates, key=lambda t: t[2])
 
-    # Final parts used
+    # Final parts used for CSV
     final_parts = []
     def _extend_unique(seq):
         seen = set(final_parts)
@@ -918,15 +928,16 @@ def compute_row(row, labor_rate):
         out['Grade B Selling Price'] = price_B
         out['Grade B Margin'] = margin_B
 
-    # CSV parts breakdown
+    # CSV-only parts breakdown
     out['Functional Parts (List)']       = "|".join(func_parts)
     out['Cosmetic Parts Grade A (List)'] = "|".join(cosA_parts_list)
     out['Adhesives (By Category)']       = "|".join(cosA_adh_list)
     out['Reglass Type Used']             = re_part_used
     out['Final Parts Used (List)']       = "|".join(final_parts)
+
     return out
 
-# -------------------- Run --------------------
+# -------------------- RUN --------------------
 rows = []
 for _, r in merged.iterrows():
     out = compute_row(r, labor_rate)
