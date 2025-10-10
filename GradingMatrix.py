@@ -190,21 +190,26 @@ def _http_download(url: str, dest: Path):
         raise
     return True
 
+# === PATCH START: re-enable Parts HTTP pull ===
 def pull_http_public_files_if_needed():
-    # Parts: disabled for simplicity — we’re loading from PARTS_DIR/PARTS_PATH now.
+    # Parts
+    if PARTS_PUBLIC_URL:
+        try:
+            if not _fresh_enough(PARTS_TARGET, HTTP_TTL):
+                _http_download(PARTS_PUBLIC_URL, PARTS_TARGET)
+        except Exception as e:
+            st.warning(f"HTTP parts pull failed: {e}")
+
+    # Live
     if LIVE_PUBLIC_URL:
         try:
             if not _fresh_enough(LIVE_TARGET, HTTP_TTL):
                 _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
         except Exception as e:
             st.warning(f"HTTP live pull failed: {e}")
-    if LIVE_PUBLIC_URL:
-        try:
-            if not _fresh_enough(LIVE_TARGET, HTTP_TTL):
-                _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
-        except Exception as e:
-            st.warning(f"HTTP live pull failed: {e}")
-# === PATCH END: re-enable Parts HTTP pull ===       
+# === PATCH END: re-enable Parts HTTP pull ===
+st.caption(f"Parts cached? {PARTS_TARGET.exists()}  | Live cached? {LIVE_TARGET.exists()}")
+
 
 # -------------------- Utility helpers --------------------
 def normalize_imei_series(s: pd.Series) -> pd.Series:
