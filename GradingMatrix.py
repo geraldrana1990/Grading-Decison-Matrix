@@ -198,6 +198,13 @@ def pull_http_public_files_if_needed():
                 _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
         except Exception as e:
             st.warning(f"HTTP live pull failed: {e}")
+    if LIVE_PUBLIC_URL:
+        try:
+            if not _fresh_enough(LIVE_TARGET, HTTP_TTL):
+                _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
+        except Exception as e:
+            st.warning(f"HTTP live pull failed: {e}")
+# === PATCH END: re-enable Parts HTTP pull ===       
 
 # -------------------- Utility helpers --------------------
 def normalize_imei_series(s: pd.Series) -> pd.Series:
