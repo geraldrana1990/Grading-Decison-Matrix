@@ -388,8 +388,15 @@ def _expand_globs(patterns):
         except Exception: uniq[p] = 0
     return [k for k,_ in sorted(uniq.items(), key=lambda kv: kv[1], reverse=True)]
 
+
 def _pick_parts_path():
     # 1) Fixed file path wins, if given and valid
+    # === PATCH START: prefer HTTP-downloaded Parts if present ===
+    # 0) If an HTTP-downloaded parts file exists, use it
+    if PARTS_TARGET.exists():
+        return str(PARTS_TARGET.resolve())
+# === PATCH END: prefer HTTP-downloaded Parts if present ===
+
     if PARTS_FIXED_PATH:
         p = Path(PARTS_FIXED_PATH)
         if p.exists() and p.is_file():
