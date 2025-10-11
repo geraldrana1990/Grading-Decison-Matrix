@@ -47,16 +47,11 @@ APP_DIR = Path(__file__).resolve().parent
 if _on_streamlit_cloud():
     DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", "/tmp/bb360-data")).resolve()
 else:
-    # Set BB360_DATA_ROOT to your actual OneDrive DATA folder if you want:
-    # e.g. BB360_DATA_ROOT="C:\\Users\\Ecotec\\OneDrive - Ecotec Star FZCO\\Documents\\DATA"
     DATA_ROOT = Path(os.environ.get("BB360_DATA_ROOT", APP_DIR / "data")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 # -------- Simple Parts locations --------
-# Optional: point to a single file
 PARTS_FIXED_PATH = os.environ.get("PARTS_PATH", "").strip()
-
-# Or point to a single folder (defaults to DATA_ROOT/parts)
 PARTS_DIR = Path(os.environ.get("PARTS_DIR", DATA_ROOT / "parts")).resolve()
 PARTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -88,26 +83,22 @@ DEFAULTS = {
     "pricing": {"battery_default": "BATTERY CELL", "lcd_default": "LCM GENERIC (HARD OLED)"},
     "labor": {"ceq_minutes": 2, "use_qc_labor": True},
     "auto_sources": {
-        # XLSX/XLS only for parts
         "parts_globs": [
             "parts/*.xlsx",
             "data/parts/*.xlsx",
             "*parts*.xlsx",
         ],
-        # Live supports XLSX/XLS/CSV only
         "live_globs": [
-            # Prefer AS.xlsx in common spots
             "live/AS.xlsx", "data/live/AS.xlsx",
             "AS.xlsx", "data/AS.xlsx",
-            # still allow other names/types as fallback
             "live/*.xlsx", "live/*.csv",
             "data/live/*.xlsx", "data/live/*.csv",
             "*live*.xlsx", "*live*.csv",
         ],
     },
     "live": {
-        "default_path": "",   # you can hardcode a full path here if desired
-        "require": True,      # Live is REQUIRED
+        "default_path": "",
+        "require": True,
         "glob_paths": [],
     }
 }
@@ -142,15 +133,13 @@ PARTS_PUBLIC_URL = os.environ.get("PARTS_PUBLIC_URL", "").strip()
 LIVE_PUBLIC_URL  = os.environ.get("LIVE_PUBLIC_URL", "").strip()
 HTTP_TTL = int(os.environ.get("HTTP_TTL", "900"))  # seconds
 
-PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")   # parts workbook (xlsx)
-LIVE_TARGET  = (DATA_ROOT / "AS.xlsx")                          # Live workbook exact name
+PARTS_TARGET = (DATA_ROOT / "parts" / "parts-http.auto.xlsx")
+LIVE_TARGET  = (DATA_ROOT / "AS.xlsx")
 
 def _normalize_dl_url(url: str) -> str:
-    """Try to coerce OneDrive/SharePoint view links to direct-download."""
     if not url:
         return url
     u = url
-    # Common cases: add or force ?download=1
     if "download=1" not in u.lower():
         joiner = "&" if "?" in u else "?"
         u = f"{u}{joiner}download=1"
@@ -169,71 +158,50 @@ def _http_download(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, allow_redirects=True, stream=True, timeout=60) as r:
         r.raise_for_status()
-        # Avoid caching obvious HTML responses
         ct = r.headers.get("Content-Type", "").lower()
         if "text/html" in ct:
-            raise ValueError("Remote server returned HTML, not a file (check that the link is public-direct with ?download=1).")
-        # Write to disk
+            raise ValueError("Remote server returned HTML, not a file (check that the link is a direct download).")
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1<<20):
                 if chunk:
                     f.write(chunk)
-    # Quick signature check for xlsx (zip starts with "PK"); clean up bad files to allow a re-download
     try:
         with open(dest, "rb") as rf:
             sig = rf.read(2)
         if sig != b"PK":
-            raise ValueError("Downloaded file is not a valid XLSX (no 'PK' zip signature). Make sure your link is a direct download.")
-    except Exception as e:
+            raise ValueError("Downloaded file is not a valid XLSX (no 'PK' zip signature).")
+    except Exception:
         try: dest.unlink(missing_ok=True)
         except Exception: pass
         raise
     return True
 
-# === PATCH START: re-enable Parts HTTP pull ===
 def pull_http_public_files_if_needed():
-    # Parts
     if PARTS_PUBLIC_URL:
         try:
             if not _fresh_enough(PARTS_TARGET, HTTP_TTL):
                 _http_download(PARTS_PUBLIC_URL, PARTS_TARGET)
         except Exception as e:
             st.warning(f"HTTP parts pull failed: {e}")
-
-    # Live
     if LIVE_PUBLIC_URL:
         try:
             if not _fresh_enough(LIVE_TARGET, HTTP_TTL):
                 _http_download(LIVE_PUBLIC_URL, LIVE_TARGET)
         except Exception as e:
             st.warning(f"HTTP live pull failed: {e}")
-# === PATCH END: re-enable Parts HTTP pull ===
-st.caption(f"Parts cached? {PARTS_TARGET.exists()}  | Live cached? {LIVE_TARGET.exists()}")
-
 
 # -------------------- Utility helpers --------------------
 def normalize_imei_series(s: pd.Series) -> pd.Series:
-    """
-    Make IMEIs comparable across sources:
-      - cast to str
-      - strip whitespace
-      - keep digits only
-      - if longer than 15, keep the LEFTMOST 15 digits (safer with Excel rounding)
-      - turn empty -> NA
-    """
     out = (
         s.astype(str)
          .str.strip()
-         .str.replace(r"\D", "", regex=True)   # digits only
+         .str.replace(r"\D", "", regex=True)
     )
     out = out.mask(out.eq(""), pd.NA)
-    # NEW: keep the **first** 15 digits (safer: Excel preserves leading digits)
-    out = out.where(out.isna() | (out.str.len() <= 15), out.str[:15])
+    out = out.where(out.isna() | (out.str.len() <= 15), out.str[:15])  # keep LEFTMOST 15
     return out
 
-
 _LIVE_IMEI_TOKENS = ["imei", "imei1", "imei 1", "imei/meid", "meid", "esn", "serial", "sn", "a number", "a-number"]
-# === PATCH END 2/4 ===
 
 def keyify(s: str) -> str: return re.sub(r'[^A-Z0-9]+', '', str(s).upper())
 def uph_key(name: str) -> str: return re.sub(r'[^a-z0-9]+', '', str(name).lower())
@@ -273,16 +241,13 @@ def _read_sheet_any(xls: pd.ExcelFile, aliases, required=True, allow_substring=T
     def _norm(s: str) -> str: return re.sub(r'[^a-z0-9]+', '', str(s).lower())
     available = list(xls.sheet_names)
     norm_map = {_norm(s): s for s in available}
-    # exact
     for cand in aliases:
         if cand in available:
             return pd.read_excel(xls, sheet_name=cand, engine="openpyxl")
-    # normalized
     for cand in aliases:
         nk = _norm(cand)
         if nk in norm_map:
             return pd.read_excel(xls, sheet_name=norm_map[nk], engine="openpyxl")
-    # substring
     if allow_substring:
         for cand in aliases:
             nk = _norm(cand)
@@ -297,15 +262,16 @@ def _read_sheet_any(xls: pd.ExcelFile, aliases, required=True, allow_substring=T
             f"Available: {available}"
         )
     else:
-        try: st.warning(f"Optional sheet '{warn_name or aliases[0]}' not found. Continuing empty.")
-        except Exception: pass
+        try:
+            with st.sidebar:
+                st.warning(f"Optional sheet '{warn_name or aliases[0]}' not found. Continuing empty.")
+        except Exception:
+            pass
         return pd.DataFrame()
 
 # -------- Parts reader (Excel only) --------
 def _read_parts_bundle_any(file_obj_or_path: str | os.PathLike, name_hint: str = ""):
-    # Force openpyxl to avoid engine ambiguity
     xls = pd.ExcelFile(file_obj_or_path, engine="openpyxl")
-    # exact names per your workbook, plus tolerant aliases
     F2P_ALIASES        = ["F2P", "FaultsToParts", "F2P Mapping", "F2P_Map", "F2P Sheet"]
     COSMETIC_ALIASES   = ["Cosmetic Category", "Cosmetics", "CosmeticCategory"]
     PRICELIST_ALIASES  = ["Pricelist", "Price List", "Parts Price", "Parts Pricelist"]
@@ -320,15 +286,17 @@ def _read_parts_bundle_any(file_obj_or_path: str | os.PathLike, name_hint: str =
         purchase_price = _read_sheet_any(xls, PURCHASE_ALIASES, required=True, warn_name="Purchase Price")
     except ValueError:
         purchase_price = pd.DataFrame({"SKU": [], "Acquisition price": [], "Grade A": [], "Grade B": [], "Grade C": []})
-        try: st.warning("Purchase Price sheet not found. Created an empty table (all prices=0).")
-        except Exception: pass
+        try:
+            with st.sidebar:
+                st.warning("Purchase Price sheet not found. Created an empty table (all prices=0).")
+        except Exception:
+            pass
 
     return f2p_parts, cosmetic_cat, pricelist, uph, purchase_price
 
 # -------- Live reader (CSV/Excel only) --------
 
 def _read_live_any(file_obj_or_path, name_hint: str = ""):
-    # Prefer "Inventory" → else contains 'inventory' → Handset → Raw Data → first sheet
     name_low = (name_hint or str(file_obj_or_path)).lower()
 
     def _pick_sheet(xls: pd.ExcelFile):
@@ -385,8 +353,12 @@ def _expand_globs(patterns):
                 except Exception:
                     pass
     try:
-        st.caption("Auto-discovery scanned patterns:"); [st.text(f"  - {s}") for s in scanned]
-    except Exception: pass
+        with st.sidebar:
+            st.caption("Auto-discovery scanned patterns:")
+            for s in scanned:
+                st.text(f"  - {s}")
+    except Exception:
+        pass
     uniq = {}
     for p in results:
         try: uniq[p] = os.path.getmtime(p)
@@ -395,12 +367,8 @@ def _expand_globs(patterns):
 
 
 def _pick_parts_path():
-    # 1) Fixed file path wins, if given and valid
-    # === PATCH START: prefer HTTP-downloaded Parts if present ===
-    # 0) If an HTTP-downloaded parts file exists, use it
     if PARTS_TARGET.exists():
         return str(PARTS_TARGET.resolve())
-# === PATCH END: prefer HTTP-downloaded Parts if present ===
 
     if PARTS_FIXED_PATH:
         p = Path(PARTS_FIXED_PATH)
@@ -410,7 +378,6 @@ def _pick_parts_path():
             st.error(f"PARTS_PATH is set but not found:\n{PARTS_FIXED_PATH}")
             st.stop()
 
-    # 2) Otherwise: look in PARTS_DIR and pick the newest .xlsx
     try:
         candidates = [p for p in PARTS_DIR.glob("*.xlsx") if p.is_file()]
         if not candidates:
@@ -420,7 +387,6 @@ def _pick_parts_path():
                 "Tip: set PARTS_PATH to a specific file if you want to lock it."
             )
             st.stop()
-        # newest first by modified time
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return str(candidates[0].resolve())
     except Exception as e:
@@ -428,7 +394,6 @@ def _pick_parts_path():
         st.stop()
 
 def _find_as_xlsx():
-    # Prefer a file literally named 'AS.xlsx' in common locations
     for p in [
         APP_DIR / "AS.xlsx",
         DATA_ROOT / "AS.xlsx",
@@ -456,7 +421,6 @@ def _pick_live_path():
 # -------------------- Inputs --------------------
 uploaded = st.file_uploader('Upload BB360 export (CSV / Excel)', type=['xlsx','xls','csv'])
 
-# === PATCH START 3/4: precedence + rerun on manual live upload ===
 live_override = st.file_uploader(
     'Upload Live file (optional; CSV / Excel). Leave empty to auto/pull.',
     type=['xlsx','xls','csv'],
@@ -464,20 +428,14 @@ live_override = st.file_uploader(
 )
 
 # Decide the active LIVE source via signature, and force a clean rerun when it changes
-live_sig = _file_signature(live_override)  # e.g., "ZN Batch 5.xlsx:123456" or None
+live_sig = _file_signature(live_override)
 _ensure_rerun_when_source_changes("_active_live_sig", live_sig)
-# === PATCH END 3/4 ===
 
 # Pull from public links if configured (writes to DATA_ROOT)
 pull_http_public_files_if_needed()
 
 @st.cache_data(show_spinner=False)
 def autoload_parts_and_live(live_upload_meta, live_upload_bytes):
-    """
-    live_upload_meta: dict or None  -> used only to vary the cache key (name/size)
-    live_upload_bytes: bytes or None -> actual file content if user uploaded
-    """
-    # Parts
     parts_path = _pick_parts_path()
     if not parts_path:
         st.error(
@@ -490,9 +448,6 @@ def autoload_parts_and_live(live_upload_meta, live_upload_bytes):
     f2p_parts, cosmetic_cat, pricelist, uph_df, purchase_price = _read_parts_bundle_any(parts_path)
     parts_label = f"{parts_path}"
 
-    # Live — precedence:
-    # 1) If user uploaded a file this run, use it (never write to disk)
-    # 2) Else use auto-pulled / discovered AS.xlsx path
     if live_upload_bytes:
         bio = io.BytesIO(live_upload_bytes)
         name_hint = live_upload_meta["name"] if live_upload_meta else "(upload)"
@@ -514,7 +469,6 @@ def load_bb360(uploaded_file):
     fn = uploaded_file.name.lower()
     if fn.endswith('.csv'):   return pd.read_csv(uploaded_file)
     if fn.endswith(('.xlsx', '.xls')): return pd.read_excel(uploaded_file, engine="openpyxl")
-    # fallback
     try:
         return pd.read_csv(uploaded_file)
     except Exception:
@@ -526,7 +480,7 @@ if not uploaded:
 
 df_raw = load_bb360(uploaded)
 
-# Prepare live upload metadata and bytes (used to vary the cache key and provide file content)
+# Prepare live upload metadata and bytes
 if live_override is not None:
     try:
         live_override.seek(0)
@@ -545,24 +499,44 @@ else:
     live_upload_meta = None
     live_upload_bytes = None
 
-# === PATCH START 4/4: include the signature in the cache key (prevents stale results) ===
 cache_sig_meta = {"sig": live_sig} if live_sig else {"sig": "NOUPLOAD"}
 f2p_parts, cosmetic_cat, pricelist, uph_tbl, purchase_price, as_inv, PARTS_SOURCE, LIVE_SOURCE = autoload_parts_and_live(
     {**(live_upload_meta or {}), **cache_sig_meta} if live_upload_meta is not None else cache_sig_meta,
     live_upload_bytes
 )
-# === PATCH END 4/4 ===
 
-st.caption(f"APP_DIR:  {APP_DIR}")
-st.caption(f"DATA_ROOT:{DATA_ROOT}")
-st.caption(f"Parts source: {PARTS_SOURCE}")
-st.caption(f"Live source:  {LIVE_SOURCE}")
+# === SIDEBAR: sources + controls ===
+with st.sidebar:
+    st.markdown("### BB360 • Sources")
+    st.caption(f"APP_DIR:  {APP_DIR}")
+    st.caption(f"DATA_ROOT: {DATA_ROOT}")
+    st.caption(f"Parts source: {PARTS_SOURCE}")
+    st.caption(f"Live source:  {LIVE_SOURCE}")
+    try:
+        parts_cached = PARTS_TARGET.exists()
+    except Exception:
+        parts_cached = False
+    try:
+        live_cached = LIVE_TARGET.exists()
+    except Exception:
+        live_cached = False
+    st.caption(f"Parts cached? {parts_cached}  |  Live cached? {live_cached}")
 
-# Enforce Live presence (required)
-if (as_inv is None or as_inv.empty) and CFG.get("live", {}).get("require", True):
-    st.error("Live file is required but none was found.\n"
-             "Set LIVE_PUBLIC_URL, place AS.xlsx in data/ or app folder, define live.default_path in config.yml, or upload a file.")
-    st.stop()
+    # <<<< MOVED HERE: Hide-rows checkbox >>>>
+    drop_na_left = st.checkbox("Hide BB360 rows with missing/invalid IMEI", value=True, key="hide_bb360_rows")
+
+    # Optional diagnostics toggle
+    show_diag = st.checkbox("Show diagnostics", value=False)
+    if show_diag:
+        with st.expander("Diagnostics", expanded=False):
+            try:
+                st.write({
+                    "BB360 rows": len(df_raw),
+                    "Live rows": 0 if as_inv is None else len(as_inv),
+                    "LIVE_SOURCE": str(LIVE_SOURCE),
+                })
+            except Exception:
+                pass
 
 # -------------------- Constants / Maps --------------------
 ALLOWED_PROFILES = {"ECOTEC GRADING TEST 1", "ECOTEC GRADING TEST 2"}
@@ -581,7 +555,7 @@ IGNORE_B_FOR_DECISION = {'C0', 'C1', 'C3', 'C3-BG', 'C2-BG'}
 LCD_CATEGORY_FALLBACK_MIN = 45.0
 _re_lcd = re.compile(r'(pixel\s*test|screen\s*burn|screen\s*test)', re.I)
 
-# -------------------- Robust Purchase Price index builder --------------------
+# -------------------- Purchase Price index --------------------
 def build_purchase_index(purchase_price_df: pd.DataFrame) -> dict:
     if not isinstance(purchase_price_df, pd.DataFrame) or purchase_price_df.empty:
         return {}
@@ -621,8 +595,11 @@ def build_purchase_index(purchase_price_df: pd.DataFrame) -> dict:
     PP_GradeC      = _money_series(pp[c_col]   if c_col   else 0)
 
     if sku_col is None and n > 0:
-        try: st.warning("Purchase Price: no SKU column found; prices loaded but cannot be matched to SKUs.")
-        except Exception: pass
+        try:
+            with st.sidebar:
+                st.warning("Purchase Price: no SKU column found; prices loaded but cannot be matched to SKUs.")
+        except Exception:
+            pass
 
     index = {}
     for i in range(n):
@@ -639,14 +616,7 @@ def build_purchase_index(purchase_price_df: pd.DataFrame) -> dict:
 
 PURCHASE_INDEX = build_purchase_index(purchase_price)
 
-# === PATCH START: optional filter to drop BB360 rows with no IMEI (moved below after norm is built) ===
-# (Moved to run after `norm = normalize_input_df(df_raw)` so `norm` is defined)
-# === PATCH END
-
-
 # -------------------- Normalize & Filter BB360 --------------------
-
-
 def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy(); df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     normalized = pd.DataFrame(index=df.index)
@@ -681,141 +651,20 @@ if ar_col is not None:
     df_raw.drop(columns=['_a'], inplace=True, errors='ignore')
 
 norm = normalize_input_df(df_raw)
-# === PATCH START (A): keep-only IMEI normalization here; UI moved below ===
-if '_norm_imei' in norm.columns:
-    norm['_norm_imei'] = normalize_imei_series(norm['_norm_imei'])
-norm = normalize_input_df(df_raw)
-# === PATCH START (A): keep-only IMEI normalization here; UI moved below ===
 if '_norm_imei' in norm.columns:
     norm['_norm_imei'] = normalize_imei_series(norm['_norm_imei'])
 else:
     norm['_norm_imei'] = pd.NA
 
-# === PATCH: optional filter to drop BB360 rows with no IMEI (placed after norm exists) ===
-drop_na_left = st.checkbox("Hide BB360 rows with missing/invalid IMEI", value=True)
+# <<<< uses the SIDEBAR checkbox >>>>
 if drop_na_left:
     before = len(norm)
     norm = norm[norm['_norm_imei'].notna()].copy()
     try:
-        st.caption(f"Dropped {before - len(norm)} BB360 rows without a usable IMEI.")
+        with st.sidebar:
+            st.caption(f"Dropped {before - len(norm)} BB360 rows without a usable IMEI.")
     except Exception:
         pass
-# === PATCH END
-
-with st.expander("Live file diagnostics (click to expand)", expanded=False):
-    # compute counts safely so diagnostics don't reference undefined names
-    try:
-        left_raw_count = len(df_raw) if df_raw is not None else 0
-    except Exception:
-        left_raw_count = 0
-    try:
-        left_has_imei = int(norm['_norm_imei'].notna().sum()) if ('_norm_imei' in norm.columns) else 0
-    except Exception:
-        left_has_imei = 0
-
-    st.write(f"BB360 IMEIs (normalized) — count: **{left_has_imei}** / {left_raw_count}")
-
-    # Show first few raw vs normalized
-    left_imei_col = find_column(df_raw, ['imei','imei/meid','serial','a number','sn'])
-    if left_imei_col:
-        preview = pd.DataFrame({
-            'BB360 IMEI (raw)': df_raw[left_imei_col].astype(str).head(10),
-            'BB360 IMEI (normalized)': norm['_norm_imei'].astype('string').head(10),
-        })
-        st.write("Sample BB360 IMEIs (raw → normalized):")
-        st.dataframe(preview, use_container_width=True)
-    else:
-        st.write("Could not find an IMEI-like column in BB360 upload.")
-
-    # Right (Live) side stats (only if we actually have a live DF)
-    if as_inv is not None and not as_inv.empty:
-        live_cols_list = list(as_inv.columns)
-        st.write("Live columns:", live_cols_list)
-        # Detect IMEI column with the same tokens used by the merge logic
-        imei_col_live = next((c for c in as_inv.columns if any(k in c for k in _LIVE_IMEI_TOKENS)), None)
-        st.write(f"Detected IMEI column in Live: **{imei_col_live if imei_col_live else '(not found)'}**")
-
-        if imei_col_live:
-            live_seen = normalize_imei_series(as_inv[imei_col_live])
-            live_count = live_seen.notna().sum()
-            st.write(f"Live IMEIs (normalized) — count: **{live_count}** / {len(as_inv)}")
-
-            # Overlap diagnostics
-            left_set = set(norm['_norm_imei'].dropna().astype(str))
-            live_set = set(live_seen.dropna().astype(str))
-            overlap = left_set & live_set
-            st.write(f"Overlap IMEIs between BB360 and Live — count: **{len(overlap)}**")
-
-            # Examples
-            try:
-                bb_only = list(left_set - live_set)[:5]
-                live_only = list(live_set - left_set)[:5]
-                st.write("Example BB360-only IMEIs:", bb_only)
-                st.write("Example Live-only IMEIs:", live_only)
-            except Exception:
-                pass
-
-            # Show first few Live raw vs normalized
-            live_preview = pd.DataFrame({
-                'Live IMEI (raw)': as_inv[imei_col_live].astype(str).head(10),
-                'Live IMEI (normalized)': live_seen.astype('string').head(10),
-            })
-            st.write("Sample Live IMEIs (raw → normalized):")
-            st.dataframe(live_preview, use_container_width=True)
-        else:
-            st.write("Live IMEI column not detected — check column names (e.g., IMEI, IMEI1, Serial, etc.).")
-    else:
-        st.write("No Live file loaded yet.")
-# === PATCH END
-
-
-# === LIVE DEBUG PATCH START (place after `norm = normalize_input_df(df_raw)`) ===
-with st.expander("Live file diagnostics (click to expand)", expanded=False):
-    try:
-        # Show which source we used
-        st.write("Live source label:", LIVE_SOURCE)
-
-        # Show BB360 IMEI stats (left side)
-        left_imei_series = norm.get('_norm_imei')
-        left_imei_series = left_imei_series.astype(str).str.replace(r"\D","", regex=True)
-        left_imei_series = left_imei_series.mask(left_imei_series.eq(""), pd.NA)
-        left_imei_series = left_imei_series.where(left_imei_series.isna() | (left_imei_series.str.len() <= 15),
-                                                  left_imei_series.str[-15:])
-        bb_imeis = set(left_imei_series.dropna().unique())
-        st.write("BB360 IMEIs (normalized) — count:", len(bb_imeis))
-
-        if as_inv is None or as_inv.empty:
-            st.warning("No Live dataframe loaded yet.")
-        else:
-            # Columns + quick counts
-            st.write("Live columns:", list(as_inv.columns))
-            live_lc = [str(c).lower().strip() for c in as_inv.columns]
-            # Which IMEI-like column did we detect?
-            _LIVE_IMEI_TOKENS = ["imei", "imei1", "imei 1", "imei/meid", "meid", "esn", "serial", "sn", "a number", "a-number"]
-            imei_col = next((c for c in as_inv.columns if any(tok in str(c).lower() for tok in _LIVE_IMEI_TOKENS)), None)
-            st.write("Detected IMEI column in Live:", imei_col)
-
-            if imei_col is not None:
-                live_imei_series = as_inv[imei_col].astype(str).str.replace(r"\D","", regex=True)
-                live_imei_series = live_imei_series.mask(live_imei_series.eq(""), pd.NA)
-                live_imei_series = live_imei_series.where(live_imei_series.isna() | (live_imei_series.str.len() <= 15),
-                                                          live_imei_series.str[-15:])
-                live_imeis = set(live_imei_series.dropna().unique())
-                st.write("Live IMEIs (normalized) — count:", len(live_imeis))
-
-                inter = bb_imeis & live_imeis
-                st.write("Overlap IMEIs between BB360 and Live — count:", len(inter))
-
-                if len(inter) == 0 and len(live_imeis) > 0 and len(bb_imeis) > 0:
-                    # surface a few examples to show why join is empty
-                    st.write("Example BB360-only IMEIs:", list((bb_imeis - live_imeis))[:5])
-                    st.write("Example Live-only IMEIs:", list((live_imeis - bb_imeis))[:5])
-            else:
-                st.error("No IMEI-like column detected in Live. Check sheet headers and make sure one of these tokens exists: " +
-                         ", ".join(_LIVE_IMEI_TOKENS))
-    except Exception as _e:
-        st.warning(f"Live diagnostics note: {_e}")
-
 
 # -------------------- Live merge (REQUIRED; upload overrides auto) --------------------
 if as_inv is None or as_inv.empty:
@@ -825,7 +674,6 @@ if as_inv is None or as_inv.empty:
     merged['SKU_KEY'] = merged['_norm_model'].astype(str).str.upper().str.strip()
 else:
     as_inv.columns = [str(c).strip().lower() for c in as_inv.columns]
-    # === broader IMEI detection ===
     imei_col = next((c for c in as_inv.columns if any(k in c for k in _LIVE_IMEI_TOKENS)), None)
 
     cat_col  = next((c for c in as_inv.columns if "category" in c), None)
@@ -838,7 +686,6 @@ else:
     color_col      = _find_live_col(["color","colour"])
     capacity_col   = _find_live_col(["capacity","storage","rom"])
 
-    # Normalize IMEIs and force inner join
     norm['_norm_imei'] = normalize_imei_series(norm.get('_norm_imei', pd.Series([], dtype=object)))
     as_inv[imei_col]   = normalize_imei_series(as_inv[imei_col])
 
@@ -850,7 +697,6 @@ else:
         how='inner'
     ).rename(columns={cat_col: 'Category'}).drop(columns=[imei_col], errors='ignore')
 
-    # SKU & SKU_KEY
     merged['SKU'] = ''
     if sku_col: merged['SKU'] = merged[sku_col].astype(str).str.strip()
     fallback_model_series = merged[live_model_col] if (live_model_col and live_model_col in merged.columns) else merged['_norm_model']
@@ -1006,7 +852,9 @@ def select_cosmetic_breakdown_grade_A(model, cat_val):
 # -------------------- User selectors --------------------
 battery_type = st.selectbox("Battery Type", ["BATTERY CELL","BATTERY OEM","BATTERY OEM PULLED"], index=0).upper()
 lcd_type = st.selectbox("LCD Type", ["LCM GENERIC (HARD OLED)","LCM GENERIC (TFT)","LCM -OEM REFURBISHED (GLASS CHANGED -GENERIC)","LCM GENERIC (SOFT OLED)"], index=0).upper()
-labor_rate = st.slider("Labor Rate ($/hour)", 1, 35, 5)
+
+# <<<< PATCH: replace slider with number input (default $5) >>>>
+labor_rate = st.number_input("Labor Rate ($/hour)", min_value=0.0, value=5.0, step=0.5)
 
 # -------------------- UPH index --------------------
 uph_tbl = uph_tbl[['Type of Defect', 'Ave. Repair Time (Mins)']].dropna(subset=['Type of Defect']).copy()
@@ -1016,7 +864,6 @@ UPH_INDEX = dict(zip(uph_tbl['Defect_norm'], uph_tbl['Ave. Repair Time (Mins)'])
 
 # --- NA-safe failures parser ---
 def parse_failures(summary):
-    # Treat None / NaN / pd.NA / empty strings as "no failures"
     if summary is None:
         return []
     if pd.isna(summary):
@@ -1053,7 +900,6 @@ def compute_row(row, labor_rate):
     lcd_failure_present = any(_re_lcd.search(str(f)) for f in failures)
     lcd_needed = lcd_failure_present or cat_val in {"C0", "C2-C"}
 
-    # Functional parts
     func_parts, seen_fp = [], set()
     def _add_fp(p):
         p = str(p).upper().strip()
@@ -1076,23 +922,18 @@ def compute_row(row, labor_rate):
 
     func_total = sum(float(PRICE_INDEX.get((device_model, k), 0.0)) for k in func_parts)
 
-    # Tech labor minutes (+CEQ if any failure)
     tech_minutes = sum(float(UPH_INDEX.get(uph_key(tok), 0.0)) for tok in failures)
     if failures:
         tech_minutes += float(CFG['labor'].get('ceq_minutes', 2))
-    # Category LCD fallback: only if C0/C2-C and NOT already an LCD failure token
     if cat_val in {"C0", "C2-C"} and not lcd_failure_present:
-        tech_minutes += LCD_CATEGORY_FALLBACK_MIN  # +45 min
+        tech_minutes += 45.0
 
     tech_labor_cost = (tech_minutes / 60.0) * float(labor_rate)
 
-    # -------------------- Refurb labor (category) --------------------
-    # You asked to ADD 'C2' and 'C2-BG' here (leaving C2-C as-is).
     refcat_set = {'C0', 'C1', 'C2', 'C2-BG', 'C3-BG', 'C3-HF', 'C3'}
     refurb_minutes = float(UPH_INDEX.get(uph_key(cat_val), 0.0)) if cat_val in refcat_set else 0.0
     refurb_labor_cost = (refurb_minutes / 60.0) * float(labor_rate)
 
-    # Re-glass (eligible cats only)
     RE_ELIGIBLE_CATS = {'C1','C2','C2-BG'}
     re_applicable = cat_val in RE_ELIGIBLE_CATS
     has_mts = any("multitouchscreen" in str(f).lower().replace(" ", "").replace("-", "") for f in failures) if re_applicable else False
@@ -1108,7 +949,6 @@ def compute_row(row, labor_rate):
     preferred_key = 'REGLASSDIGITIZER' if has_mts else 'REGLASS'
     reglass_price = float(PL_RE_BY_MODEL.get(device_model, {}).get(preferred_key, 0.0)) if re_applicable else 0.0
 
-    # QC / BNP / Anodizing
     qc_min = 0.0
     for key_try in ["qc process","qc inspection","qcinspection","qc","quality control","quality check"]:
         qc_min = max(qc_min, float(UPH_INDEX.get(uph_key(key_try), 0.0)))
@@ -1127,33 +967,30 @@ def compute_row(row, labor_rate):
     anod_min = max(float(UPH_INDEX.get(uph_key("anodizing"), 0.0)),
                    float(UPH_INDEX.get(uph_key("anodise"), 0.0)))
     anod_cats = {'C2','C2-C','C2-BG','C3-BG','C4'}
+    ANODIZING_ELIGIBLE_MODELS = {"IPHONE SE","IPHONE SE 2020","IPHONE SE 2022","IPHONE 11","IPHONE XR","IPHONE 12","IPHONE 12 MINI","IPHONE 13","IPHONE 13 MINI","IPHONE 14","IPHONE 14 PLUS"}
     anod_cost = (anod_min / 60.0) * float(labor_rate) if (device_model in ANODIZING_ELIGIBLE_MODELS and cat_val in anod_cats and anod_min>0) else 0.0
 
-    # Cosmetic & adhesives
     cos_A, cosA_parts_list, cosA_adh_list = select_cosmetic_breakdown_grade_A(device_model, cat_val)
     adh_list_only = adhesive_list_for(device_model, cat_val)
     cos_B = sum(float(PRICE_INDEX.get((device_model, a), 0.0)) for a in adh_list_only)
 
-    # Totals
     refurb_A = func_total + cos_A + reglass_price + reglass_labor_cost + refurb_labor_cost + anod_cost + bnp_cost + tech_labor_cost + qc_cost
     refurb_B = func_total + cos_B + reglass_price + reglass_labor_cost + refurb_labor_cost + anod_cost + bnp_cost + tech_labor_cost + qc_cost
     refurb_C = func_total + tech_labor_cost + qc_cost
 
-    # Prices & margins
     pp = PURCHASE_INDEX.get(sku_key, {"acq":0.0,"A":0.0,"B":0.0,"C":0.0})
     acq = float(pp["acq"]); price_A = float(pp["A"]); price_B = float(pp["B"]); price_C = float(pp["C"])
     margin_A = price_A - (acq + refurb_A)
     margin_B = price_B - (acq + refurb_B)
     margin_C = price_C - (acq + refurb_C)
 
-    # Decision (B may be ineligible)
+    IGNORE_B_FOR_DECISION = {'C0', 'C1', 'C3', 'C3-BG', 'C2-BG'}
     b_ineligible = cat_val in IGNORE_B_FOR_DECISION
     candidates = [("A", price_A, margin_A, refurb_A), ("C", price_C, margin_C, refurb_C)]
     if not b_ineligible:
         candidates.append(("B", price_B, margin_B, refurb_B))
     best_grade, best_price, best_margin, best_refurb = max(candidates, key=lambda t: t[2])
 
-    # Final parts used for CSV
     final_parts = []
     def _extend_unique(seq):
         seen = set(final_parts)
@@ -1203,7 +1040,6 @@ def compute_row(row, labor_rate):
         out['Grade B Selling Price'] = price_B
         out['Grade B Margin'] = margin_B
 
-    # CSV-only parts breakdown
     out['Functional Parts (List)']       = "|".join(func_parts)
     out['Cosmetic Parts Grade A (List)'] = "|".join(cosA_parts_list)
     out['Adhesives (By Category)']       = "|".join(cosA_adh_list)
@@ -1313,5 +1149,3 @@ if not res_df.empty:
     st.download_button('Download Full CSV', data=csv_bytes, file_name='bb360_business_view_full.csv', mime='text/csv')
 else:
     st.info("No qualifying rows to display.")
-
-    
